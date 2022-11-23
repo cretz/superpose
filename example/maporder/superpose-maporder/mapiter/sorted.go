@@ -17,7 +17,7 @@ type MapIter[K comparable, V any] struct {
 	value       V
 }
 
-func NewOrderedIter[K constraints.Ordered, V interface{}](m map[K]V) *MapIter[K, V] {
+func NewSortedIter[K constraints.Ordered, V interface{}](m map[K]V) *MapIter[K, V] {
 	ret := &MapIter[K, V]{
 		initialKeys: make([]K, 0, len(m)),
 		m:           m,
@@ -42,20 +42,11 @@ func (m *MapIter[K, V]) Next() bool {
 	return false
 }
 
-func (m *MapIter[K, V]) Key() K {
+func (m *MapIter[K, V]) Pair() (K, V) {
 	if m.keyIndex < 0 {
 		panic("next never called")
 	} else if m.keyIndex >= len(m.initialKeys) {
 		panic("past end of iterator")
 	}
-	return m.initialKeys[m.keyIndex]
-}
-
-func (m *MapIter[K, V]) Value() V {
-	if m.keyIndex < 0 {
-		panic("next never called")
-	} else if m.keyIndex >= len(m.initialKeys) {
-		panic("past end of iterator")
-	}
-	return m.value
+	return m.initialKeys[m.keyIndex], m.value
 }

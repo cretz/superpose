@@ -13,21 +13,29 @@ var someMap = map[string]string{
 	"qux-key": "qux-val",
 }
 
-func init() {
-	fmt.Println("ORIG INIT")
-}
-
 func main() {
-	fmt.Println("Normal print map:")
 	PrintMap()
-
-	fmt.Println("\nSorted print map:")
-	orderedPrintMap()
+	sortedPrintMap()
+	// insertionPrintMap()
 }
 
 func PrintMap() {
+	// Can check which dimension we are in
+	switch {
+	case inSorted:
+		fmt.Println("Ordered print map via sorted iteration:")
+	// case inInsertion:
+	// 	fmt.Println("Ordered print map by insertion order:")
+	default:
+		fmt.Println("Normal print map:")
+	}
+
+	// Do print
 	otherpkg.PrintMap(someMap)
 }
 
-// mapsort:PrintMap
-var orderedPrintMap func()
+var sortedPrintMap func() //maporder_sorted:PrintMap
+var inSorted bool         //maporder_sorted:<in>
+
+// var insertionPrintMap func() //maporder_insertion:PrintMap
+// var inInsertion bool         //maporder_insertion:<in>
