@@ -35,9 +35,13 @@ const (
 	mapIterAlias = "__mapiter"
 )
 
-func (*transformer) AppliesToPackage(ctx *superpose.TransformContext, pkg *packages.Package) (bool, error) {
-	// Does not apply to "runtime" or our impl
-	return pkg.PkgPath != "runtime" && pkg.PkgPath != mapIterPkg, nil
+func (*transformer) AppliesToPackage(ctx *superpose.TransformContext, pkg string) (bool, error) {
+	// TODO: Remove this part where it's only applying to our specific piece
+	// during test
+	return pkg != "github.com/cretz/superpose/example/maporder" &&
+		pkg != "github.com/cretz/superpose/example/otherpkg", nil
+	// // Does not apply to "runtime" or our impl
+	// return pkg.PkgPath != "runtime" && pkg.PkgPath != mapIterPkg, nil
 }
 
 func (t *transformer) Transform(

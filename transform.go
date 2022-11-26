@@ -22,8 +22,6 @@ type TransformContext struct {
 type TransformPackage struct {
 	*packages.Package
 	GoBuildID          string
-	LastBuiltPath      string
-	LastBuiltVersion   string
 	CurrentlyCompiling bool
 	Transformed        bool
 	// If true, this is already cached and any transform is ignored
@@ -61,7 +59,7 @@ func WrapWithPatch(n ast.Node, lhs, rhs string) *Patch {
 }
 
 type Transformer interface {
-	AppliesToPackage(ctx *TransformContext, pkg *packages.Package) (bool, error)
+	AppliesToPackage(ctx *TransformContext, pkg string) (bool, error)
 	Transform(ctx *TransformContext, pkgs []*TransformPackage) ([]*TransformedPackage, error)
 }
 
