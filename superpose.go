@@ -11,6 +11,7 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"hash"
 	"log"
 	"os"
 	"os/exec"
@@ -18,6 +19,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"golang.org/x/tools/go/packages"
 )
 
 type Config struct {
@@ -28,9 +31,12 @@ type Config struct {
 	Transformers  map[string]Transformer
 	Verbose       bool
 	RetainTempDir bool
-	// If true, the dependencies' syntax is loaded and present in the import
-	// packages instead of just the empty import package which is default
-	NeedDepsSyntax bool
+	// TODO(cretz): What is the default?
+	CacheDir string
+
+	// TODO(cretz): Allow customizing of load mode. If NeedDeps is present, import
+	// packages could be reused instead of running load per package.
+	// LoadMode: packages.LoadMode
 }
 
 type Superpose struct {
@@ -174,65 +180,181 @@ func (s *Superpose) DimensionPackage(dimension string) string {
 func (s *Superpose) transformCompileArgs(args []string, importPath string) ([]string, error) {
 	// We need to build dependencies for every dimension
 	for dim, t := range s.Config.Transformers {
-		if err := s.buildDimension(dim, t, importPath); err != nil {
+		if builder, err := s.newDimensionBuilder(dim, t); err != nil {
+			return nil, err
+		} else if err := builder.build(importPath); err != nil {
 			return nil, fmt.Errorf("failed building dimension %v: %w", dim, err)
 		}
 	}
 
-	// Now add inits for any file part of the compile that references the
-	// dimensions. First get all the files off the args, then update each as
-	// needed.
+	// Now check every go file for dimension references and add an init file to
+	// populate those vars from the dimension
+	initBuilder := s.newDimensionInitBuilder()
 	for i := len(args) - 1; i >= 0; i-- {
 		// If we've hit a non-go file, we're done
 		if strings.HasPrefix(args[i], "-") || !strings.HasSuffix(args[i], ".go") {
 			break
 		}
 		// Add dimension references if needed
-		if updatedFile, err := s.addDimensionReferences(args[i], importPath); err != nil {
-			return nil, fmt.Errorf("failed adding dimension references to %v: %w", args[i], err)
-		} else if updatedFile != "" {
-			args[i] = updatedFile
+		if err := initBuilder.collectDimensionReferences(args[i], importPath); err != nil {
+			return nil, fmt.Errorf("failed collecting dimension references from %v: %w", args[i], err)
 		}
 	}
-	// Args have been updated
-	return args, nil
+	// If there are any init statements, write the file and add to end of compile
+	if len(initBuilder.initStatements) > 0 {
+		initFile, err := initBuilder.writeTempInitFile()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, initFile)
+	}
 
-	// TODO(cretz):
-	// * For every dimension, run entire transformer on every package and
-	//   dependency package
-	//   * Each package transformed should be at the same full import path but one
-	//     deeper based on dimension
-	//   * Also make sure to replace all imports
-	//   * Consider loading without NeedDeps
-	//   * Can we reuse go mod area or go cache area or gopath area for our stuff?
-	// * If any of the compiled files have a //<dimension>:<func>|"<in>" then
-	//   create a new file populating those vars on init
-	//   * Make it clear dimensions not reference-able within each other currently
-	//   * Can be a temp file, only needs to last for compile
+	return args, nil
 }
 
-func (s *Superpose) buildDimension(dim string, t Transformer, importPath string) error {
+type dimensionBuilder struct {
+	*Superpose
+	packageActionIDs map[string][]byte
+	cachedAppliesTo  map[string]bool
+
+	dim         string
+	transformer Transformer
+	// Key is import path, value is dir
+	handledImportPaths map[string]string
+	hash               hash.Hash
+}
+
+func (s *Superpose) newDimensionBuilder(dim string, t Transformer) (*dimensionBuilder, error) {
+	// TODO(cretz): "go list -export" to get build IDs for packages
 	panic("TODO")
 }
 
-// Empty string ww/ no error if no dimension references
-func (s *Superpose) addDimensionReferences(goFile string, importPath string) (newGoFile string, err error) {
+func (d *dimensionBuilder) build(importPath string) error {
+	// If the action ID cannot be found or the import has already been handled,
+	// do nothing
+	actionID := d.packageActionIDs[importPath]
+	if len(actionID) == 0 || d.handledImportPaths[importPath] != "" {
+		return nil
+	}
+
+	// Check if applies
+	ctx := &TransformContext{Context: context.Background(), Superpose: d.Superpose, Dimension: d.dim}
+	if applies, err := d.appliesTo(ctx, importPath); !applies || err != nil {
+		return err
+	}
+
+	// Build a hash of the package's action ID, this executable's content ID, and
+	// the config's version get a cache key
+	// TODO(cretz): Should compile-args play into the cache key?
+	exeContentID, err := fetchExeContentID()
+	if err != nil {
+		return err
+	}
+	d.hash.Reset()
+	d.hash.Write(actionID)
+	d.hash.Write(exeContentID)
+	d.hash.Write([]byte(d.Config.Version))
+	cacheKeyBytes := d.hash.Sum(nil)[:15]
+
+	// Prepare directory
+	dimImportPath := path.Join(importPath, d.DimensionPackage(d.dim))
+	cachedPackageDir := filepath.Join(d.Config.CacheDir, dimImportPath)
+	// Append the base64'd action ID to the cache dir
+	cachedPackageDir += "-" + base64.RawURLEncoding.EncodeToString(cacheKeyBytes)
+	d.handledImportPaths[importPath] = cachedPackageDir
+	// If the directory is already present this has already been built for this
+	// cache key and we can move on
+	if _, err := os.Stat(cachedPackageDir); err == nil {
+		return nil
+	}
+
+	// Now that we are building, we need to load the package. We do not need deps'
+	// syntax but we basically need everything else.
+	packagesLogf := d.Debugf
+	if !d.Config.Verbose {
+		packagesLogf = nil
+	}
+	pkgs, err := packages.Load(
+		&packages.Config{
+			Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+				packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes |
+				packages.NeedSyntax | packages.NeedTypesInfo,
+			Logf: packagesLogf,
+			// TODO(cretz): Load test packages too?
+			// Tests: true,
+		},
+		importPath,
+	)
+	if err != nil || len(pkgs) == 0 {
+		return err
+	} else if len(pkgs) != 1 {
+		return fmt.Errorf("expected only a single package for %v, got %v", importPath, len(pkgs))
+	} else if len(pkgs[0].Errors) > 0 {
+		// We'll debug-print any errors encountered, but we won't fail the build,
+		// we'll let the downstream Go compiler give those errors
+		for i, err := range pkgs[0].Errors {
+			d.Debugf("Failed loading package %v, error #%v: %v", importPath, i+1, err)
+		}
+		return nil
+	}
+	pkg := pkgs[0]
+
+	// Walk the deps first, transforming those before this
+	for depImportPath := range pkg.Imports {
+		if err := d.build(depImportPath); err != nil {
+			return err
+		}
+	}
+
+	// TODO(cretz):
+	// * Run user transformer
+	// * Change all import paths
+	// * Set all "//dim:<in>" bool vars to true
+	panic("TODO")
+}
+
+func (d *dimensionBuilder) appliesTo(ctx *TransformContext, importPath string) (bool, error) {
+	applies, cached := d.cachedAppliesTo[importPath]
+	if !cached {
+		var err error
+		if applies, err = d.transformer.AppliesToPackage(ctx, importPath); err != nil {
+			return false, err
+		}
+		d.cachedAppliesTo[importPath] = applies
+	}
+	return applies, nil
+}
+
+type dimensionInitBuilder struct {
+	*Superpose
+
+	// Lazily set then checked every time thereafter
+	packageName    string
+	imports        map[string]string
+	initStatements []string
+}
+
+func (s *Superpose) newDimensionInitBuilder() *dimensionInitBuilder {
+	return &dimensionInitBuilder{Superpose: s, imports: map[string]string{}}
+}
+
+func (d *dimensionInitBuilder) collectDimensionReferences(goFile string, importPath string) error {
 	// We load the file ahead of time here since we may manip later
 	b, err := os.ReadFile(goFile)
 	if err != nil {
-		return "", err
+		return err
 	}
 	// To save some perf, we're gonna look for the dimension comments anywhere in
 	// file
 	var foundDim string
-	for dim := range s.Config.Transformers {
+	for dim := range d.Config.Transformers {
 		if bytes.Contains(b, []byte("//"+dim+":")) {
 			foundDim = dim
 			break
 		}
 	}
 	if foundDim == "" {
-		return "", nil
+		return nil
 	}
 
 	// Parse so we can check dim references
@@ -241,15 +363,24 @@ func (s *Superpose) addDimensionReferences(goFile string, importPath string) (ne
 	// If there's an error parsing, we are going to ignore it because downstream
 	// will show the error later
 	if err != nil {
-		s.Debugf("Ignoring %v, failed parsing: %v", goFile, err)
-		return "", nil
+		d.Debugf("Ignoring %v, failed parsing: %v", goFile, err)
+		return nil
+	}
+
+	// If the package is _test, fail. Otherwise, check/store package name
+	if strings.HasSuffix(file.Name.Name, "_test") {
+		return fmt.Errorf("cannot have dimensions in test files, found %v dimension in %v", foundDim, goFile)
+	} else if d.packageName == "" {
+		d.packageName = file.Name.Name
+	} else if d.packageName != file.Name.Name {
+		// Just ignore this, the actual compiler will report a better error
+		d.Debugf("Ignoring %v, package %v different than expected %v", goFile, file.Name.Name, d.packageName)
+		return nil
 	}
 
 	// Check each top-level var decl for dimension reference and build up
 	// statements
-	dimsSeen := map[string]bool{}
-	var dimImportStatements []string
-	var dimInitStatements []string
+	anyStatements := false
 	for _, decl := range file.Decls {
 		// Only var decl
 		varDecl, _ := decl.(*ast.GenDecl)
@@ -268,39 +399,31 @@ func (s *Superpose) addDimensionReferences(goFile string, importPath string) (ne
 				continue
 			}
 			dim, ref := strings.TrimPrefix(pieces[0], "//"), pieces[1]
-			t := s.Config.Transformers[dim]
+			t := d.Config.Transformers[dim]
 			// If no transformer or only "<in>", does not apply to us
 			if t == nil {
 				continue
 			}
 			// The transformer cannot be ignoring this package
 			applies, err := t.AppliesToPackage(
-				&TransformContext{Context: context.Background(), Superpose: s, Dimension: dim},
+				&TransformContext{Context: context.Background(), Superpose: d.Superpose, Dimension: dim},
 				importPath,
 			)
 			if err != nil {
-				return "", err
+				return err
 			} else if !applies {
-				return "", fmt.Errorf("dimension %v referenced in package %v, but it is not applied",
-					dim, importPath)
-			}
-
-			// If the dimension has not been seen, add import statement
-			if !dimsSeen[dim] {
-				dimsSeen[dim] = true
-				dimImportStatements = append(dimImportStatements,
-					fmt.Sprintf("import %q", path.Join(importPath, s.DimensionPackage(dim))))
+				return fmt.Errorf("dimension %v referenced in package %v, but it is not applied", dim, importPath)
 			}
 
 			// Validate the var decl
 			if len(valSpec.Names) != 1 {
-				return "", fmt.Errorf("dimension func vars can only have a single identifier")
+				return fmt.Errorf("dimension func vars can only have a single identifier")
 			}
 			funcType, _ := valSpec.Type.(*ast.FuncType)
 			if funcType != nil {
-				return "", fmt.Errorf("var %v is not typed with a func", valSpec.Names[0].Name)
+				return fmt.Errorf("var %v is not typed with a func", valSpec.Names[0].Name)
 			} else if len(valSpec.Values) != 0 {
-				return "", fmt.Errorf("var %v cannot have default", valSpec.Names[0].Name)
+				return fmt.Errorf("var %v cannot have default", valSpec.Names[0].Name)
 			}
 
 			// Find function in same file that is being referenced
@@ -313,7 +436,7 @@ func (s *Superpose) addDimensionReferences(goFile string, importPath string) (ne
 				}
 			}
 			if funcDecl == nil {
-				return "", fmt.Errorf("unable to find func decl %v", ref)
+				return fmt.Errorf("unable to find func decl %v", ref)
 			}
 
 			// Confirm the signatures are identical (param names and everything). Just
@@ -321,44 +444,62 @@ func (s *Superpose) addDimensionReferences(goFile string, importPath string) (ne
 			emptyFset := token.NewFileSet()
 			var expected, actual strings.Builder
 			if err := printer.Fprint(&expected, emptyFset, funcType); err != nil {
-				return "", err
+				return err
 			} else if err := printer.Fprint(&actual, emptyFset, funcDecl.Type); err != nil {
-				return "", err
+				return err
 			} else if expected.String() != actual.String() {
-				return "", fmt.Errorf("expected var %v to have type %v, instead had %v",
+				return fmt.Errorf("expected var %v to have type %v, instead had %v",
 					valSpec.Names[0].Name, expected, actual)
 			}
 
 			// Now confirmed, add init statement
-			dimInitStatements = append(dimInitStatements,
-				fmt.Sprintf("%v = %v.%v", valSpec.Names[0].Name, s.DimensionPackage(dim), ref))
+			d.Debugf("Setting var %v to function reference of %v in dimension %v", valSpec.Names[0].Name, ref, dim)
+			importAlias := d.importAlias(path.Join(importPath, d.DimensionPackage(dim)))
+			d.initStatements = append(d.initStatements,
+				fmt.Sprintf("%v = %v.%v", valSpec.Names[0].Name, importAlias, ref))
+			anyStatements = true
 		}
 	}
 
 	// We expected at least one
-	if len(dimInitStatements) == 0 {
-		return "", fmt.Errorf("no proper dimension references found, though %v referenced", foundDim)
+	if !anyStatements {
+		return fmt.Errorf("no proper dimension references found, though %v referenced", foundDim)
 	}
+	return nil
+}
 
-	// Add import statements as semicolon delimited on package line so as not to
-	// disturb line numbers
-	pkgEndPos := fset.Position(file.Name.End())
-	b = append(b[:pkgEndPos.Offset],
-		append([]byte("; "+strings.Join(dimImportStatements, "; ")), b[pkgEndPos.Offset:]...)...)
-	// Add init function at the end
-	b = append(b, "\n\nfunc init() {\n\t"+strings.Join(dimInitStatements, "\n\t")+"\n}\n"...)
+func (d *dimensionInitBuilder) importAlias(importPath string) string {
+	alias := d.imports[importPath]
+	if alias == "" {
+		alias = fmt.Sprintf("import%v", len(d.imports)+1)
+		d.imports[importPath] = alias
+	}
+	return alias
+}
+
+func (d *dimensionInitBuilder) writeTempInitFile() (string, error) {
+	// Build code
+	code := "package " + d.packageName + "\n\n"
+	for alias, importPath := range d.imports {
+		code += fmt.Sprintf("import %v %q\n", alias, importPath)
+	}
+	code += "\nfunc init() {\n"
+	for _, stmt := range d.initStatements {
+		code += "\t" + stmt + "\n"
+	}
+	code += "}\n"
 
 	// Write to a temp file
-	tmpDir, err := s.UseTempDir()
+	tmpDir, err := d.UseTempDir()
 	if err != nil {
 		return "", err
 	}
-	f, err := os.CreateTemp(tmpDir, filepath.Base(goFile))
+	f, err := os.CreateTemp(tmpDir, "superpose-*.go")
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	if _, err := f.Write(b); err != nil {
+	if _, err := f.Write([]byte(code)); err != nil {
 		return "", err
 	}
 	return f.Name(), nil
@@ -376,7 +517,7 @@ func (s *Superpose) compileVersionFull(tool string, args []string) error {
 	}
 
 	// Get this exe's content ID
-	exeContentID, err := loadExeContentID()
+	exeContentID, err := fetchExeContentID()
 	if err != nil {
 		return err
 	}
@@ -427,21 +568,29 @@ func loadGoToolID(tool string, args []string) (line string, b []byte, err error)
 	return
 }
 
-func loadExeContentID() ([]byte, error) {
-	// Most of this taken from Garble
-	exePath, err := os.Executable()
-	if err != nil {
-		return nil, err
-	}
-	cmd := exec.Command("go", "tool", "buildid", exePath)
-	out, err := cmd.Output()
-	if err != nil {
-		if err, _ := err.(*exec.ExitError); err != nil {
-			return nil, fmt.Errorf("%v: %s", err, err.Stderr)
+var exeContentID []byte
+
+func fetchExeContentID() ([]byte, error) {
+	if len(exeContentID) == 0 {
+		// Most of this taken from Garble
+		exePath, err := os.Executable()
+		if err != nil {
+			return nil, err
 		}
-		return nil, err
+		cmd := exec.Command("go", "tool", "buildid", exePath)
+		out, err := cmd.Output()
+		if err != nil {
+			if err, _ := err.(*exec.ExitError); err != nil {
+				return nil, fmt.Errorf("%v: %s", err, err.Stderr)
+			}
+			return nil, err
+		}
+		buildID := string(out)
+		contentID := buildID[strings.LastIndex(buildID, "/")+1:]
+		exeContentID, err = base64.RawURLEncoding.DecodeString(contentID)
+		if err != nil {
+			return nil, err
+		}
 	}
-	buildID := string(out)
-	contentID := buildID[strings.LastIndex(buildID, "/")+1:]
-	return base64.RawURLEncoding.DecodeString(contentID)
+	return exeContentID, nil
 }

@@ -21,21 +21,10 @@ type TransformContext struct {
 
 type TransformPackage struct {
 	*packages.Package
-	GoBuildID          string
 	CurrentlyCompiling bool
 	Transformed        bool
 	// If true, this is already cached and any transform is ignored
 	Cached bool
-}
-
-type TransformedPackage struct {
-	ID string
-	// Keyed by FileSet's file name. This should not be used to patch imports.
-	// TODO(cretz): Then how can they patch imports?
-	Patches []*Patch
-
-	// TODO(cretz): NewFiles map[string]string
-	// TODO(cretz): DeleteFiles []string
 }
 
 type Range struct{ Pos, End token.Pos }
@@ -59,8 +48,10 @@ func WrapWithPatch(n ast.Node, lhs, rhs string) *Patch {
 }
 
 type Transformer interface {
-	AppliesToPackage(ctx *TransformContext, pkg string) (bool, error)
-	Transform(ctx *TransformContext, pkgs []*TransformPackage) ([]*TransformedPackage, error)
+	// TODO(cretz): Document that if a package is not applied, its dependencies
+	// aren't either
+	AppliesToPackage(ctx *TransformContext, pkgPath string) (bool, error)
+	Transform(ctx *TransformContext, pkg *TransformPackage) ([]*Patch, error)
 }
 
 // May reorder slice
