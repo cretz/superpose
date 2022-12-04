@@ -6,3 +6,10 @@ Superpose is a library for creating Go compiler wrappers/plugins that support tr
 "dimensions" and making them callable from the original package.
 
 TODO(cretz): More docs
+TODO(cretz): Make sure to test:
+* An import whose package name is not related to its path
+* Different build tags
+* Test files/packages
+* go:embed
+* Build caching
+* Build "-a" to invalidate cache

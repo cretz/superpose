@@ -21,10 +21,6 @@ type TransformContext struct {
 
 type TransformPackage struct {
 	*packages.Package
-	CurrentlyCompiling bool
-	Transformed        bool
-	// If true, this is already cached and any transform is ignored
-	Cached bool
 }
 
 type Range struct{ Pos, End token.Pos }
