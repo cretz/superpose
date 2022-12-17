@@ -6,7 +6,6 @@ import (
 	"go/types"
 
 	"github.com/cretz/superpose"
-	"golang.org/x/tools/go/packages"
 )
 
 func main() {
@@ -35,37 +34,19 @@ const (
 	mapIterAlias = "__mapiter"
 )
 
-func (*transformer) AppliesToPackage(ctx *superpose.TransformContext, pkg string) (bool, error) {
+func (*transformer) AppliesToPackage(ctx *superpose.TransformContext, pkgPath string) (bool, error) {
 	// TODO: Remove this part where it's only applying to our specific piece
 	// during test
-	return pkg != "github.com/cretz/superpose/example/maporder" &&
-		pkg != "github.com/cretz/superpose/example/otherpkg", nil
+	return pkgPath != "github.com/cretz/superpose/example/maporder" &&
+		pkgPath != "github.com/cretz/superpose/example/otherpkg", nil
 	// // Does not apply to "runtime" or our impl
 	// return pkg.PkgPath != "runtime" && pkg.PkgPath != mapIterPkg, nil
 }
 
 func (t *transformer) Transform(
 	ctx *superpose.TransformContext,
-	pkgs []*superpose.TransformPackage,
-) ([]*superpose.TransformedPackage, error) {
-	if !t.sorted {
-		return nil, fmt.Errorf("insertion not supported yet")
-	}
-	// Transform every non-cached-but-transformed package
-	var transforms []*superpose.TransformedPackage
-	for _, pkg := range pkgs {
-		if !pkg.Cached && pkg.Transformed {
-			if patches, err := transformPackage(pkg.Package); err != nil {
-				return nil, fmt.Errorf("package %v failed transform: %w", pkg, err)
-			} else if len(patches) > 0 {
-				transforms = append(transforms, &superpose.TransformedPackage{ID: pkg.ID, Patches: patches})
-			}
-		}
-	}
-	return transforms, nil
-}
-
-func transformPackage(pkg *packages.Package) ([]*superpose.Patch, error) {
+	pkg *superpose.TransformPackage,
+) ([]*superpose.Patch, error) {
 	// Go over each file adding patches if there are any
 	var patches []*superpose.Patch
 	for _, file := range pkg.Syntax {
@@ -88,7 +69,7 @@ func transformPackage(pkg *packages.Package) ([]*superpose.Patch, error) {
 	return patches, nil
 }
 
-func transformNode(pkg *packages.Package, node ast.Node) *superpose.Patch {
+func transformNode(pkg *superpose.TransformPackage, node ast.Node) *superpose.Patch {
 	rangeStmt, _ := node.(*ast.RangeStmt)
 	if rangeStmt == nil {
 		return nil

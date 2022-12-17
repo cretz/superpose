@@ -33,8 +33,7 @@ type Config struct {
 	Transformers  map[string]Transformer
 	Verbose       bool
 	RetainTempDir bool
-	// TODO(cretz): What is the default?
-	CacheDir string
+	CacheDir      string
 
 	// TODO(cretz): Allow customizing of load mode. If NeedDeps is present, import
 	// packages could be reused instead of running load per package.
@@ -59,6 +58,10 @@ func New(config Config) (*Superpose, error) {
 		return nil, fmt.Errorf("version required")
 	} else if len(config.Transformers) == 0 {
 		return nil, fmt.Errorf("at least one transformer required")
+	}
+	// TODO(cretz): Can I use one of the Go paths as my cache dir instead of temp?
+	if config.CacheDir == "" {
+		config.CacheDir = filepath.Join(os.TempDir(), ".superpose-cache")
 	}
 	return &Superpose{Config: config}, nil
 }
@@ -122,7 +125,7 @@ func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 		}
 	}
 
-	// We only care about compile
+	// Get import path and tool exe
 	importPath := os.Getenv("TOOLEXEC_IMPORTPATH")
 	if importPath == "" {
 		return fmt.Errorf("no import path found")
@@ -207,7 +210,7 @@ func (s *Superpose) transformCompileArgs(args []string, importPath string) ([]st
 	for dim := range initBuilder.dimensionsSeen {
 		s.Debugf("Found dimension %v in %v, ensuring built for this package and dependencies", dim, importPath)
 		// We can trust the transformer is present
-		if builder, err := s.newDimensionBuilder(dim, s.Config.Transformers[dim]); err != nil {
+		if builder, err := s.newDimensionBuilder(dim, importPath, s.Config.Transformers[dim]); err != nil {
 			return nil, err
 		} else if err := builder.build(importPath); err != nil {
 			return nil, fmt.Errorf("failed building dimension %v on package %v: %w", dim, importPath, err)
@@ -229,9 +232,20 @@ type dimensionBuilder struct {
 	hash               hash.Hash
 }
 
-func (s *Superpose) newDimensionBuilder(dim string, t Transformer) (*dimensionBuilder, error) {
-	// TODO(cretz): "go list -export" to get build IDs for packages
-	panic("TODO")
+func (s *Superpose) newDimensionBuilder(dim string, initialPackage string, t Transformer) (*dimensionBuilder, error) {
+	packageActionIDs, err := loadPackageActionIDs(initialPackage)
+	if err != nil {
+		return nil, err
+	}
+	return &dimensionBuilder{
+		Superpose:          s,
+		packageActionIDs:   packageActionIDs,
+		cachedAppliesTo:    map[string]bool{},
+		dim:                dim,
+		transformer:        t,
+		handledImportPaths: map[string]string{},
+		hash:               sha256.New(),
+	}, nil
 }
 
 func (d *dimensionBuilder) build(importPath string) error {
@@ -770,4 +784,28 @@ func fetchExeContentID() ([]byte, error) {
 		}
 	}
 	return exeContentID, nil
+}
+
+func loadPackageActionIDs(initialPackage string) (map[string][]byte, error) {
+	// Use "go list" to get action IDs for this package and every dependency
+	b, err := exec.Command(
+		"go", "list", "-f", "{{.ImportPath}}|{{.BuildID}}", "-export", "-deps", initialPackage).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed listing packages: %w. Output: %s", err, b)
+	}
+	// Go over each line, breaking out the action ID and the package path
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	packageActionIDs := make(map[string][]byte, len(lines))
+	for _, line := range lines {
+		lastSlash := strings.LastIndex(line, "/")
+		lastPipe := strings.LastIndex(line, "|")
+		if lastSlash < 0 || lastPipe < 0 {
+			return nil, fmt.Errorf("invalid list line: %v", line)
+		}
+		packageActionIDs[line[:lastPipe]], err = base64.RawURLEncoding.DecodeString(line[lastSlash+1:])
+		if err != nil {
+			return nil, fmt.Errorf("invalid action ID: %w, list line: %v", err, line)
+		}
+	}
+	return packageActionIDs, nil
 }
