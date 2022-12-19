@@ -25,6 +25,22 @@ type TransformPackage struct {
 
 type Range struct{ Pos, End token.Pos }
 
+func (r *Range) Overlaps(other *Range) bool {
+	// Check that current pos/end isn't inside the other range or vice versa
+	return r.Contains(other.Pos) ||
+		(other.End > other.Pos && r.Contains(other.End-1)) ||
+		other.Contains(r.Pos) ||
+		(r.End > r.Pos && other.Contains(r.End-1))
+}
+
+func (r *Range) Contains(p token.Pos) bool {
+	// If there's no end, we only need to check if it's exactly the start
+	if !r.End.IsValid() {
+		return p == r.Pos
+	}
+	return r.Pos <= p && r.End > p
+}
+
 func RangeOf(x ast.Node) Range {
 	return Range{Pos: x.Pos(), End: x.End()}
 }
@@ -62,11 +78,8 @@ func ApplyPatches(fset *token.FileSet, patches []*Patch) (map[string][]byte, err
 		} else if patch.Range.End.IsValid() && patch.Range.End < patch.Range.Pos {
 			return nil, fmt.Errorf("patch end before start")
 		}
-		if i > 0 {
-			prev := patches[i-1]
-			if patch.Range.Pos >= prev.Range.Pos || (patch.Range.End.IsValid() && patch.Range.End >= prev.Range.Pos) {
-				return nil, fmt.Errorf("patches overlap")
-			}
+		if i > 0 && patches[i-1].Range.Overlaps(&patch.Range) {
+			return nil, fmt.Errorf("patches overlap")
 		}
 		if err := ApplyPatch(fset, patch, files); err != nil {
 			return nil, err

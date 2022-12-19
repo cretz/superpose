@@ -88,6 +88,12 @@ func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 		return fmt.Errorf("only assume toolexec currently supported")
 	}
 
+	// If the first arg is --verbose, set as verbose and remove the arg
+	if args[0] == "--verbose" {
+		s.Config.Verbose = true
+		args = args[1:]
+	}
+
 	// Find index of first non-additional arg
 	toolArgIndex := 0
 	if config.AdditionalFlags != nil {
@@ -126,11 +132,6 @@ func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 	}
 
 	// Get import path and tool exe
-	importPath := os.Getenv("TOOLEXEC_IMPORTPATH")
-	if importPath == "" {
-		return fmt.Errorf("no import path found")
-	}
-	s.Debugf("Import path %v, args: %v", importPath, args)
 	args = args[toolArgIndex:]
 	_, tool := filepath.Split(args[0])
 	if runtime.GOOS == "windows" {
@@ -143,6 +144,11 @@ func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 	}
 
 	// Run tool (using our custom args if compile)
+	importPath := os.Getenv("TOOLEXEC_IMPORTPATH")
+	if importPath == "" {
+		return fmt.Errorf("no import path found")
+	}
+	s.Debugf("Import path %v, args: %v", importPath, args)
 	goToolArgs := args[1:]
 	if tool == "compile" {
 		var err error
@@ -186,6 +192,7 @@ func (s *Superpose) transformCompileArgs(args []string, importPath string) ([]st
 	// Check every go file for dimension references and add an init file to
 	// populate those vars from the dimension
 	s.Debugf("Checking for any dimension references in %v", importPath)
+	var newImportCfgMaps []string
 	initBuilder := s.newDimensionInitBuilder()
 	for i := len(args) - 1; i >= 0; i-- {
 		// If we've hit a non-go file, we're done
@@ -214,9 +221,21 @@ func (s *Superpose) transformCompileArgs(args []string, importPath string) ([]st
 			return nil, err
 		} else if err := builder.build(importPath); err != nil {
 			return nil, fmt.Errorf("failed building dimension %v on package %v: %w", dim, importPath, err)
+		} else if newImportMaps, err := builder.importMaps(); err != nil {
+			return nil, err
+		} else {
+			newImportCfgMaps = append(newImportCfgMaps, newImportMaps...)
 		}
 	}
 
+	// If there are any additional import cfg maps, update import cfg
+	if len(newImportCfgMaps) > 0 {
+		if err := s.updateImportCfgArg(args, newImportCfgMaps); err != nil {
+			return nil, fmt.Errorf("importcfg update failed: %w", err)
+		}
+		// And add our cache dir as an additional arg for import purposes
+		args = append([]string{"-I", s.Config.CacheDir}, args...)
+	}
 	return args, nil
 }
 
@@ -274,16 +293,29 @@ func (d *dimensionBuilder) build(importPath string) error {
 	d.hash.Write(exeContentID)
 	d.hash.Write([]byte(d.Config.Version))
 	cacheKeyBytes := d.hash.Sum(nil)[:15]
+	if d.Config.Verbose {
+		d.Debugf(
+			"Cache key %v = %v (%v action ID) + %v (exe content ID) + %v (config version)",
+			base64.RawURLEncoding.EncodeToString(cacheKeyBytes),
+			base64.RawURLEncoding.EncodeToString(actionID),
+			importPath,
+			base64.RawURLEncoding.EncodeToString(exeContentID),
+			d.Config.Version,
+		)
+	}
 
 	// Prepare directory
 	dimImportPath := path.Join(importPath, d.DimensionPackage(d.dim))
 	cachedPackageDir := filepath.Join(d.Config.CacheDir, dimImportPath)
 	// Append the base64'd action ID to the cache dir
 	cachedPackageDir += "-" + base64.RawURLEncoding.EncodeToString(cacheKeyBytes)
+	d.Debugf("Using cache dir %v for package %v", cachedPackageDir, importPath)
 	d.handledImportPaths[importPath] = cachedPackageDir
+
 	// If the directory is already present this has already been built for this
 	// cache key and we can move on
 	if _, err := os.Stat(cachedPackageDir); err == nil {
+		d.Debugf("Package %v already cached, skipping build", importPath)
 		return nil
 	}
 
@@ -412,19 +444,20 @@ func (d *dimensionBuilder) transformPackage(
 	}
 
 	// Traverse files for our own patches
+	newPackageName := d.DimensionPackage(d.dim)
 	for _, file := range pkg.Syntax {
-		// Put a /*-based line directive at the end of the package line
-		fileName := pkg.Fset.File(file.Pos()).Name()
-		newFileName := filepath.Join(cachedPackageDir, filepath.Base(fileName))
+		// Change our package name to the dimension form and put a /*-based line
+		// directive at the end of the package line
 		patches = append(patches, &Patch{
-			Range: Range{Pos: file.Name.End()},
-			Str:   fmt.Sprintf(" /*line %v:%v*/", newFileName, pkg.Fset.Position(file.Name.End()).Line),
+			Range: Range{Pos: file.Package, End: file.Name.End()},
+			Str: fmt.Sprintf("package %v /*line %v:%v*/",
+				newPackageName, pkg.Fset.Position(file.Pos()).Filename, pkg.Fset.Position(file.Name.End()).Line),
 		})
 
 		// Go over every import and for each one that this dimension applies to,
 		// alter the import. Note, since the transformed packages keep the same
 		// package name, we don't have to mess with the aliases or anything.
-		filePatches, err := d.transformImports(ctx, file)
+		filePatches, err := d.transformImports(ctx, pkg, file)
 		if err != nil {
 			return nil, err
 		}
@@ -440,7 +473,11 @@ func (d *dimensionBuilder) transformPackage(
 	return patches, nil
 }
 
-func (d *dimensionBuilder) transformImports(ctx *TransformContext, file *ast.File) (patches []*Patch, err error) {
+func (d *dimensionBuilder) transformImports(
+	ctx *TransformContext,
+	pkg *packages.Package,
+	file *ast.File,
+) (patches []*Patch, err error) {
 	// Go over imports, replacing applicable ones w/ their dimension equivalents
 	for _, mport := range file.Imports {
 		if importPath, err := strconv.Unquote(mport.Path.Value); err != nil {
@@ -448,9 +485,20 @@ func (d *dimensionBuilder) transformImports(ctx *TransformContext, file *ast.Fil
 		} else if applies, err := d.appliesTo(ctx, importPath); err != nil {
 			return nil, err
 		} else if applies {
+			// Replace the import path but leave the alias. If the alias is not
+			// present, explicitly set to what the package name was.
+			var alias string
+			if mport.Name != nil {
+				alias = mport.Name.Name
+			} else if importPkg := pkg.Imports[importPath]; importPkg == nil {
+				return nil, fmt.Errorf("missing import for %v", importPath)
+			} else {
+				alias = importPkg.Name
+			}
+			dimPkg := path.Join(importPath, d.DimensionPackage(ctx.Dimension))
 			patches = append(patches, &Patch{
-				Range: RangeOf(mport.Path),
-				Str:   strconv.Quote(path.Join(importPath, d.DimensionPackage(ctx.Dimension))),
+				Range: RangeOf(mport),
+				Str:   fmt.Sprintf("%v %q", alias, dimPkg),
 			})
 		}
 	}
@@ -489,19 +537,6 @@ func (d *dimensionBuilder) transformInBoolVars(ctx *TransformContext, file *ast.
 	return
 }
 
-func (d *dimensionBuilder) addLineDirective(
-	ctx *TransformContext,
-	pkg *packages.Package,
-	newFileName string,
-	file *ast.File,
-) *Patch {
-	// Put a /*-based line directive at the end of the package line
-	return &Patch{
-		Range: Range{Pos: file.Name.End()},
-		Str:   fmt.Sprintf(" /*line %v:%v*/", newFileName, pkg.Fset.Position(file.Name.End()).Line),
-	}
-}
-
 func (d *dimensionBuilder) appliesTo(ctx *TransformContext, importPath string) (bool, error) {
 	applies, cached := d.cachedAppliesTo[importPath]
 	if !cached {
@@ -512,6 +547,21 @@ func (d *dimensionBuilder) appliesTo(ctx *TransformContext, importPath string) (
 		d.cachedAppliesTo[importPath] = applies
 	}
 	return applies, nil
+}
+
+func (d *dimensionBuilder) importMaps() ([]string, error) {
+	// Add every dimension import, relativizing from the cache dir
+	var importMaps []string
+	for importPath, actualPath := range d.handledImportPaths {
+		origImportPath := path.Join(importPath, d.DimensionPackage(d.dim))
+		newImportPath, err := filepath.Rel(d.Config.CacheDir, actualPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed relativizing %v based at %v: %w", actualPath, d.Config.CacheDir, err)
+		}
+		newImportPath = filepath.ToSlash(newImportPath)
+		importMaps = append(importMaps, origImportPath+"="+newImportPath)
+	}
+	return importMaps, nil
 }
 
 type dimensionInitBuilder struct {
@@ -591,7 +641,7 @@ func (d *dimensionInitBuilder) collectDimensionReferences(goFile string, importP
 			dim, ref := strings.TrimPrefix(pieces[0], "//"), pieces[1]
 			t := d.Config.Transformers[dim]
 			// If no transformer or only "<in>", does not apply to us
-			if t == nil {
+			if t == nil || ref == "<in>" {
 				continue
 			}
 			d.dimensionsSeen[dim] = struct{}{}
@@ -611,7 +661,7 @@ func (d *dimensionInitBuilder) collectDimensionReferences(goFile string, importP
 				return fmt.Errorf("dimension func vars can only have a single identifier")
 			}
 			funcType, _ := spec.Type.(*ast.FuncType)
-			if funcType != nil {
+			if funcType == nil {
 				return fmt.Errorf("var %v is not typed with a func", spec.Names[0].Name)
 			} else if len(spec.Values) != 0 {
 				return fmt.Errorf("var %v cannot have default", spec.Names[0].Name)
@@ -671,7 +721,7 @@ func (d *dimensionInitBuilder) importAlias(importPath string) string {
 func (d *dimensionInitBuilder) writeTempInitFile() (string, error) {
 	// Build code
 	code := "package " + d.packageName + "\n\n"
-	for alias, importPath := range d.imports {
+	for importPath, alias := range d.imports {
 		code += fmt.Sprintf("import %v %q\n", alias, importPath)
 	}
 	code += "\nfunc init() {\n"
@@ -690,6 +740,7 @@ func (d *dimensionInitBuilder) writeTempInitFile() (string, error) {
 		return "", err
 	}
 	defer f.Close()
+	d.Debugf("Writing the following code to %v:\n%s\n", f.Name(), code)
 	if _, err := f.Write([]byte(code)); err != nil {
 		return "", err
 	}
@@ -728,6 +779,50 @@ func (s *Superpose) compileVersionFull(tool string, args []string) error {
 	// Append content ID as end of fake build ID
 	fmt.Printf("%s +superpose buildID=_/_/_/%s\n", goOutLine, contentID)
 	return nil
+}
+
+func (s *Superpose) updateImportCfgArg(compileArgs []string, newImportMaps []string) error {
+	// Find the importcfg file
+	importCfgIndex := -1
+	for i, arg := range compileArgs {
+		if arg == "-importcfg" && len(compileArgs) >= i {
+			importCfgIndex = i + 1
+		}
+	}
+	if importCfgIndex == -1 {
+		return fmt.Errorf("no importcfg argument")
+	}
+
+	// Read existing
+	importCfgBytes, err := os.ReadFile(compileArgs[importCfgIndex])
+	if err != nil {
+		return fmt.Errorf("failed reading importcfg file: %w", err)
+	}
+	importCfg := strings.TrimSpace(string(importCfgBytes))
+	// Go tooling puts a newline at the end, so we will also
+	importCfg += "\n"
+	for _, line := range newImportMaps {
+		importCfg += "importmap " + line + "\n"
+	}
+
+	// Create new temp importcfg
+	tmpDir, err := s.UseTempDir()
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(tmpDir, "importcfg")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// Write the new lines
+	s.Debugf("Copying importcfg from %v to %v and adding import maps: %v",
+		compileArgs[importCfgIndex], f.Name(), newImportMaps)
+	_, err = f.Write([]byte(importCfg))
+	if err == nil {
+		compileArgs[importCfgIndex] = f.Name()
+	}
+	return err
 }
 
 func loadGoToolID(tool string, args []string) (line string, b []byte, err error) {
@@ -797,10 +892,14 @@ func loadPackageActionIDs(initialPackage string) (map[string][]byte, error) {
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
 	packageActionIDs := make(map[string][]byte, len(lines))
 	for _, line := range lines {
-		lastSlash := strings.LastIndex(line, "/")
 		lastPipe := strings.LastIndex(line, "|")
-		if lastSlash < 0 || lastPipe < 0 {
+		lastSlash := strings.LastIndex(line, "/")
+		if lastPipe < 0 {
 			return nil, fmt.Errorf("invalid list line: %v", line)
+		}
+		// If there is no slash, there is no action ID
+		if lastSlash < 0 {
+			continue
 		}
 		packageActionIDs[line[:lastPipe]], err = base64.RawURLEncoding.DecodeString(line[lastSlash+1:])
 		if err != nil {

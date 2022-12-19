@@ -8,6 +8,8 @@ Superpose is a library for creating Go compiler wrappers/plugins that support tr
 TODO(cretz): More docs
 TODO(cretz): Make sure to test:
 * An import whose package name is not related to its path
+* Relative/local imports
+* Explicit import aliases
 * Different build tags
 * Test files/packages
 * go:embed

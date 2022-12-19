@@ -37,8 +37,8 @@ const (
 func (*transformer) AppliesToPackage(ctx *superpose.TransformContext, pkgPath string) (bool, error) {
 	// TODO: Remove this part where it's only applying to our specific piece
 	// during test
-	return pkgPath != "github.com/cretz/superpose/example/maporder" &&
-		pkgPath != "github.com/cretz/superpose/example/otherpkg", nil
+	return pkgPath == "github.com/cretz/superpose/example/maporder" ||
+		pkgPath == "github.com/cretz/superpose/example/maporder/otherpkg", nil
 	// // Does not apply to "runtime" or our impl
 	// return pkg.PkgPath != "runtime" && pkg.PkgPath != mapIterPkg, nil
 }
@@ -47,6 +47,7 @@ func (t *transformer) Transform(
 	ctx *superpose.TransformContext,
 	pkg *superpose.TransformPackage,
 ) ([]*superpose.Patch, error) {
+	ctx.Superpose.Debugf("Transforming package %v", pkg.PkgPath)
 	// Go over each file adding patches if there are any
 	var patches []*superpose.Patch
 	for _, file := range pkg.Syntax {
