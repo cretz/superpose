@@ -2,27 +2,18 @@ package superpose
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"flag"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/printer"
-	"go/token"
-	"hash"
-	"io"
 	"log"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 
-	"golang.org/x/tools/go/packages"
+	"github.com/rogpeppe/go-internal/cache"
 )
 
 type Config struct {
@@ -33,7 +24,8 @@ type Config struct {
 	Transformers  map[string]Transformer
 	Verbose       bool
 	RetainTempDir bool
-	CacheDir      string
+	// By default this is <user-cache>/superpose-build
+	BuildCacheDir string
 
 	// TODO(cretz): Allow customizing of load mode. If NeedDeps is present, import
 	// packages could be reused instead of running load per package.
@@ -41,8 +33,9 @@ type Config struct {
 }
 
 type Superpose struct {
-	Config  Config
-	tempDir string
+	Config     Config
+	tempDir    string
+	buildCache *cache.Cache
 }
 
 func RunMain(config Config, runConfig RunMainConfig) {
@@ -59,10 +52,6 @@ func New(config Config) (*Superpose, error) {
 	} else if len(config.Transformers) == 0 {
 		return nil, fmt.Errorf("at least one transformer required")
 	}
-	// TODO(cretz): Can I use one of the Go paths as my cache dir instead of temp?
-	if config.CacheDir == "" {
-		config.CacheDir = filepath.Join(os.TempDir(), ".superpose-cache")
-	}
 	return &Superpose{Config: config}, nil
 }
 
@@ -73,6 +62,13 @@ type RunMainConfig struct {
 }
 
 func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
+	// Cleanup the cache on complete if it's present (meaning it was used)
+	defer func() {
+		if s.buildCache != nil {
+			s.buildCache.Trim()
+		}
+	}()
+
 	// Remove temp dir if present on complete and we're not retaining
 	defer func() {
 		if !s.Config.RetainTempDir && s.tempDir != "" {
@@ -140,26 +136,22 @@ func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 
 	// Go uses -V=full at first, so handle just that
 	if len(args) == 2 && args[1] == "-V=full" {
-		return s.compileVersionFull(tool, args)
+		return s.toolexecVersionFull(tool, args)
 	}
 
-	// Run tool (using our custom args if compile)
-	importPath := os.Getenv("TOOLEXEC_IMPORTPATH")
-	if importPath == "" {
-		return fmt.Errorf("no import path found")
-	}
-	s.Debugf("Import path %v, args: %v", importPath, args)
+	s.Debugf("Intercepting toolexec with args: %v", args)
 	goToolArgs := args[1:]
 	if tool == "compile" {
 		var err error
-		if goToolArgs, err = s.transformCompileArgs(goToolArgs, importPath); err != nil {
+		if goToolArgs, err = s.onCompile(goToolArgs); err != nil {
 			return err
 		}
 		s.Debugf("Updated compile args to %v", goToolArgs)
 	} else {
-		s.Debugf("Skipping tool %v", tool)
+		s.Debugf("No interception needed for tool %v", tool)
 	}
 
+	// Run the command
 	cmd := exec.Command(args[0], goToolArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -183,571 +175,45 @@ func (s *Superpose) Debugf(f string, v ...interface{}) {
 	}
 }
 
-func (s *Superpose) DimensionPackage(dimension string) string {
-	// Just prefix with two underscores for now
-	return "__" + dimension
+func (s *Superpose) DimensionPackage(origPkg string, dimension string) string {
+	// Just delimit with two underscores for now
+	return origPkg + "__" + dimension
 }
 
-func (s *Superpose) transformCompileArgs(args []string, importPath string) ([]string, error) {
-	// Check every go file for dimension references and add an init file to
-	// populate those vars from the dimension
-	s.Debugf("Checking for any dimension references in %v", importPath)
-	var newImportCfgMaps []string
-	initBuilder := s.newDimensionInitBuilder()
-	for i := len(args) - 1; i >= 0; i-- {
-		// If we've hit a non-go file, we're done
-		if strings.HasPrefix(args[i], "-") || !strings.HasSuffix(args[i], ".go") {
-			break
-		}
-		// Add dimension references if needed
-		if err := initBuilder.collectDimensionReferences(args[i], importPath); err != nil {
-			return nil, fmt.Errorf("failed collecting dimension references from %v: %w", args[i], err)
-		}
+func (s *Superpose) onCompile(args []string) (newArgs []string, err error) {
+	// Extract flags
+	flags, err := parseCompileFlags(args)
+	if err != nil {
+		return nil, err
 	}
-	// If there are any init statements, write the file and add to end of compile
-	if len(initBuilder.initStatements) > 0 {
-		initFile, err := initBuilder.writeTempInitFile()
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, initFile)
+	// Sanity check the package path
+	if pkgPath := os.Getenv("TOOLEXEC_IMPORTPATH"); pkgPath == "" {
+		return nil, fmt.Errorf("no import path found")
+	} else if pkgPath != flags.args[flags.pkgIndex] {
+		// Sanity check
+		return nil, fmt.Errorf("import path is %v but package arg is %v", pkgPath, flags.args[flags.pkgIndex])
 	}
 
-	// For every dimension seen, build with transformers
-	for dim := range initBuilder.dimensionsSeen {
-		s.Debugf("Found dimension %v in %v, ensuring built for this package and dependencies", dim, importPath)
-		// We can trust the transformer is present
-		if builder, err := s.newDimensionBuilder(dim, importPath, s.Config.Transformers[dim]); err != nil {
-			return nil, err
-		} else if err := builder.build(importPath); err != nil {
-			return nil, fmt.Errorf("failed building dimension %v on package %v: %w", dim, importPath, err)
-		} else if newImportMaps, err := builder.importMaps(); err != nil {
-			return nil, err
-		} else {
-			newImportCfgMaps = append(newImportCfgMaps, newImportMaps...)
-		}
+	// Compile dimensions
+	if err := s.compileDimensions(flags); err != nil {
+		return nil, err
 	}
 
-	// If there are any additional import cfg maps, update import cfg
-	if len(newImportCfgMaps) > 0 {
-		if err := s.updateImportCfgArg(args, newImportCfgMaps); err != nil {
-			return nil, fmt.Errorf("importcfg update failed: %w", err)
-		}
-		// And add our cache dir as an additional arg for import purposes
-		args = append([]string{"-I", s.Config.CacheDir}, args...)
+	// Add bridge file to args if any
+	if bridgeFile, err := s.buildBridgeFile(flags); err != nil {
+		return nil, err
+	} else if bridgeFile != nil {
+		args = append(args, bridgeFile.fileName)
+		// TODO(cretz): Make a new import config file to reference all packages seen
+		// in the bridge file
+		panic("TODO")
+		// TODO(cretz): Update build ID for compile to include the init file
+		panic("TODO")
 	}
 	return args, nil
 }
 
-type dimensionBuilder struct {
-	*Superpose
-	packageActionIDs map[string][]byte
-	cachedAppliesTo  map[string]bool
-
-	dim         string
-	transformer Transformer
-	// Key is import path, value is dir
-	handledImportPaths map[string]string
-	hash               hash.Hash
-}
-
-func (s *Superpose) newDimensionBuilder(dim string, initialPackage string, t Transformer) (*dimensionBuilder, error) {
-	packageActionIDs, err := loadPackageActionIDs(initialPackage)
-	if err != nil {
-		return nil, err
-	}
-	return &dimensionBuilder{
-		Superpose:          s,
-		packageActionIDs:   packageActionIDs,
-		cachedAppliesTo:    map[string]bool{},
-		dim:                dim,
-		transformer:        t,
-		handledImportPaths: map[string]string{},
-		hash:               sha256.New(),
-	}, nil
-}
-
-func (d *dimensionBuilder) build(importPath string) error {
-	// If the action ID cannot be found or the import has already been handled,
-	// do nothing
-	actionID := d.packageActionIDs[importPath]
-	if len(actionID) == 0 || d.handledImportPaths[importPath] != "" {
-		return nil
-	}
-
-	// Check if applies
-	ctx := &TransformContext{Context: context.Background(), Superpose: d.Superpose, Dimension: d.dim}
-	if applies, err := d.appliesTo(ctx, importPath); !applies || err != nil {
-		return err
-	}
-
-	// Build a hash of the package's action ID, this executable's content ID, and
-	// the config's version get a cache key
-	// TODO(cretz): Should compile-args play into the cache key?
-	exeContentID, err := fetchExeContentID()
-	if err != nil {
-		return err
-	}
-	d.hash.Reset()
-	d.hash.Write(actionID)
-	d.hash.Write(exeContentID)
-	d.hash.Write([]byte(d.Config.Version))
-	cacheKeyBytes := d.hash.Sum(nil)[:15]
-	if d.Config.Verbose {
-		d.Debugf(
-			"Cache key %v = %v (%v action ID) + %v (exe content ID) + %v (config version)",
-			base64.RawURLEncoding.EncodeToString(cacheKeyBytes),
-			base64.RawURLEncoding.EncodeToString(actionID),
-			importPath,
-			base64.RawURLEncoding.EncodeToString(exeContentID),
-			d.Config.Version,
-		)
-	}
-
-	// Prepare directory
-	dimImportPath := path.Join(importPath, d.DimensionPackage(d.dim))
-	cachedPackageDir := filepath.Join(d.Config.CacheDir, dimImportPath)
-	// Append the base64'd action ID to the cache dir
-	cachedPackageDir += "-" + base64.RawURLEncoding.EncodeToString(cacheKeyBytes)
-	d.Debugf("Using cache dir %v for package %v", cachedPackageDir, importPath)
-	d.handledImportPaths[importPath] = cachedPackageDir
-
-	// If the directory is already present this has already been built for this
-	// cache key and we can move on
-	if _, err := os.Stat(cachedPackageDir); err == nil {
-		d.Debugf("Package %v already cached, skipping build", importPath)
-		return nil
-	}
-
-	// Now that we are building, we need to load the package. We do not need deps'
-	// syntax but we basically need everything else.
-	packagesLogf := d.Debugf
-	if !d.Config.Verbose {
-		packagesLogf = nil
-	}
-	pkgs, err := packages.Load(
-		&packages.Config{
-			Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
-				packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes |
-				packages.NeedSyntax | packages.NeedTypesInfo,
-			Logf:  packagesLogf,
-			Tests: true,
-		},
-		importPath,
-	)
-	if err != nil || len(pkgs) == 0 {
-		return err
-	}
-
-	// Go over every package, transforming
-	patchedFiles := map[string][]byte{}
-	otherFilesToCopy := map[string]struct{}{}
-	for _, pkg := range pkgs {
-		// We'll debug-print any errors encountered, but we won't fail the build,
-		// we'll let the downstream Go compiler give those errors
-		if len(pkg.Errors) > 0 {
-			for i, err := range pkg.Errors {
-				d.Debugf("Failed loading package %v, error #%v: %v", importPath, i+1, err)
-			}
-			return nil
-		}
-
-		// TODO(cretz): Add embed support. This will require us setting a dir for
-		// compilation somehow so it can read those files. Alternatively we could
-		// copy all embed files to beneath this folder.
-		if len(pkg.EmbedFiles) != 0 {
-			return fmt.Errorf("packages with embedded files not currently supported")
-		}
-
-		// Walk the deps first, transforming those before this
-		for depImportPath := range pkg.Imports {
-			if err := d.build(depImportPath); err != nil {
-				return err
-			}
-		}
-
-		// Transform the package
-		patches, err := d.transformPackage(ctx, pkg, cachedPackageDir)
-		if err != nil {
-			return fmt.Errorf("failed transforming %v: %w", pkg, err)
-		}
-
-		// Apply all patches
-		pkgPatchedFiles, err := ApplyPatches(pkg.Fset, patches)
-		if err != nil {
-			return err
-		}
-		for src, patched := range pkgPatchedFiles {
-			patchedFiles[src] = patched
-		}
-		for _, src := range pkg.OtherFiles {
-			otherFilesToCopy[src] = struct{}{}
-		}
-	}
-
-	// Make sure cached dir exists
-	if err := os.MkdirAll(cachedPackageDir, 0777); err != nil {
-		return fmt.Errorf("failed creating %v: %w", cachedPackageDir, err)
-	}
-
-	// Write patched files then other files. We expect every Go file to be
-	// patched (even if only for the line directive).
-	// TODO(cretz): What about IgnoredFiles? If for other build tags, I presume
-	// that is a different build ID and therefore different cache key
-	for src, patched := range patchedFiles {
-		dst := filepath.Join(cachedPackageDir, filepath.Base(src))
-		if err := os.WriteFile(dst, patched, 0666); err != nil {
-			return fmt.Errorf("failed writing %v patched from %v: %w", dst, src, err)
-		}
-	}
-	for src := range otherFilesToCopy {
-		dst := filepath.Join(cachedPackageDir, filepath.Base(src))
-		if err := d.copyFile(src, dst); err != nil {
-			return fmt.Errorf("failed copying %v to %v: %w", src, dst, err)
-		}
-	}
-	return nil
-}
-
-func (d *dimensionBuilder) copyFile(src, dst string) (err error) {
-	in, err := os.Open(src)
-	if err != nil {
-		return
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return
-	}
-	defer func() {
-		cerr := out.Close()
-		if err == nil {
-			err = cerr
-		}
-	}()
-	if _, err = io.Copy(out, in); err != nil {
-		return
-	}
-	err = out.Sync()
-	return
-}
-
-func (d *dimensionBuilder) transformPackage(
-	ctx *TransformContext,
-	pkg *packages.Package,
-	cachedPackageDir string,
-) ([]*Patch, error) {
-	// Run user transformer
-	patches, err := d.transformer.Transform(ctx, &TransformPackage{pkg})
-	if err != nil {
-		return nil, err
-	}
-
-	// Traverse files for our own patches
-	newPackageName := d.DimensionPackage(d.dim)
-	for _, file := range pkg.Syntax {
-		// Change our package name to the dimension form and put a /*-based line
-		// directive at the end of the package line
-		patches = append(patches, &Patch{
-			Range: Range{Pos: file.Package, End: file.Name.End()},
-			Str: fmt.Sprintf("package %v /*line %v:%v*/",
-				newPackageName, pkg.Fset.Position(file.Pos()).Filename, pkg.Fset.Position(file.Name.End()).Line),
-		})
-
-		// Go over every import and for each one that this dimension applies to,
-		// alter the import. Note, since the transformed packages keep the same
-		// package name, we don't have to mess with the aliases or anything.
-		filePatches, err := d.transformImports(ctx, pkg, file)
-		if err != nil {
-			return nil, err
-		}
-		patches = append(patches, filePatches...)
-
-		// Also set any "//dim:<in>" bool vars to true
-		filePatches, err = d.transformInBoolVars(ctx, file)
-		if err != nil {
-			return nil, err
-		}
-		patches = append(patches, filePatches...)
-	}
-	return patches, nil
-}
-
-func (d *dimensionBuilder) transformImports(
-	ctx *TransformContext,
-	pkg *packages.Package,
-	file *ast.File,
-) (patches []*Patch, err error) {
-	// Go over imports, replacing applicable ones w/ their dimension equivalents
-	for _, mport := range file.Imports {
-		if importPath, err := strconv.Unquote(mport.Path.Value); err != nil {
-			return nil, err
-		} else if applies, err := d.appliesTo(ctx, importPath); err != nil {
-			return nil, err
-		} else if applies {
-			// Replace the import path but leave the alias. If the alias is not
-			// present, explicitly set to what the package name was.
-			var alias string
-			if mport.Name != nil {
-				alias = mport.Name.Name
-			} else if importPkg := pkg.Imports[importPath]; importPkg == nil {
-				return nil, fmt.Errorf("missing import for %v", importPath)
-			} else {
-				alias = importPkg.Name
-			}
-			dimPkg := path.Join(importPath, d.DimensionPackage(ctx.Dimension))
-			patches = append(patches, &Patch{
-				Range: RangeOf(mport),
-				Str:   fmt.Sprintf("%v %q", alias, dimPkg),
-			})
-		}
-	}
-	return
-}
-
-func (d *dimensionBuilder) transformInBoolVars(ctx *TransformContext, file *ast.File) (patches []*Patch, err error) {
-	// Go over every var decl looking for a "//dim:<in>" bool var for replacing
-	expectedComment := "//" + ctx.Dimension + "<in>"
-	for _, decl := range file.Decls {
-		// Must be a "var <name> bool //dim:<in>" and nothing else
-		decl, _ := decl.(*ast.GenDecl)
-		if decl == nil || decl.Tok != token.VAR {
-			continue
-		}
-		for _, spec := range decl.Specs {
-			// Only vars w/ "//dim:<in>" comments
-			spec, _ := spec.(*ast.ValueSpec)
-			if spec == nil || spec.Comment == nil || len(spec.Comment.List) != 1 {
-				continue
-			} else if spec.Comment.List[0].Text != expectedComment {
-				continue
-			}
-			// Now we know it's the expected comment, make sure the spec is proper
-			if len(spec.Names) != 1 {
-				return nil, fmt.Errorf("dimension in bool vars can only have a single identifier")
-			} else if typ, _ := spec.Type.(*ast.Ident); typ == nil || typ.Name != "bool" {
-				return nil, fmt.Errorf("dimension in bool var %v must have explicit bool type", spec.Names[0].Name)
-			} else if len(spec.Values) != 0 {
-				return nil, fmt.Errorf("dimension in bool var %v must not have a value already", spec.Names[0].Name)
-			}
-			// Add a patch to set it to true after the end of the bool part
-			patches = append(patches, &Patch{Range: Range{Pos: spec.Type.End()}, Str: " = true"})
-		}
-	}
-	return
-}
-
-func (d *dimensionBuilder) appliesTo(ctx *TransformContext, importPath string) (bool, error) {
-	applies, cached := d.cachedAppliesTo[importPath]
-	if !cached {
-		var err error
-		if applies, err = d.transformer.AppliesToPackage(ctx, importPath); err != nil {
-			return false, err
-		}
-		d.cachedAppliesTo[importPath] = applies
-	}
-	return applies, nil
-}
-
-func (d *dimensionBuilder) importMaps() ([]string, error) {
-	// Add every dimension import, relativizing from the cache dir
-	var importMaps []string
-	for importPath, actualPath := range d.handledImportPaths {
-		origImportPath := path.Join(importPath, d.DimensionPackage(d.dim))
-		newImportPath, err := filepath.Rel(d.Config.CacheDir, actualPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed relativizing %v based at %v: %w", actualPath, d.Config.CacheDir, err)
-		}
-		newImportPath = filepath.ToSlash(newImportPath)
-		importMaps = append(importMaps, origImportPath+"="+newImportPath)
-	}
-	return importMaps, nil
-}
-
-type dimensionInitBuilder struct {
-	*Superpose
-
-	// Lazily set then checked every time thereafter
-	dimensionsSeen map[string]struct{}
-	packageName    string
-	imports        map[string]string
-	initStatements []string
-}
-
-func (s *Superpose) newDimensionInitBuilder() *dimensionInitBuilder {
-	return &dimensionInitBuilder{Superpose: s, dimensionsSeen: map[string]struct{}{}, imports: map[string]string{}}
-}
-
-func (d *dimensionInitBuilder) collectDimensionReferences(goFile string, importPath string) error {
-	// We load the file ahead of time here since we may manip later
-	b, err := os.ReadFile(goFile)
-	if err != nil {
-		return err
-	}
-	// To save some perf, we're gonna look for the dimension comments anywhere in
-	// file
-	var foundDim string
-	for dim := range d.Config.Transformers {
-		if bytes.Contains(b, []byte("//"+dim+":")) {
-			foundDim = dim
-			break
-		}
-	}
-	if foundDim == "" {
-		return nil
-	}
-
-	// Parse so we can check dim references
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, goFile, b, parser.AllErrors|parser.ParseComments)
-	// If there's an error parsing, we are going to ignore it because downstream
-	// will show the error later
-	if err != nil {
-		d.Debugf("Ignoring %v, failed parsing: %v", goFile, err)
-		return nil
-	}
-
-	// If the package is _test, fail. Otherwise, check/store package name
-	if strings.HasSuffix(file.Name.Name, "_test") {
-		return fmt.Errorf("cannot have dimensions in test files, found %v dimension in %v", foundDim, goFile)
-	} else if d.packageName == "" {
-		d.packageName = file.Name.Name
-	} else if d.packageName != file.Name.Name {
-		// Just ignore this, the actual compiler will report a better error
-		d.Debugf("Ignoring %v, package %v different than expected %v", goFile, file.Name.Name, d.packageName)
-		return nil
-	}
-
-	// Check each top-level var decl for dimension reference and build up
-	// statements
-	anyStatements := false
-	for _, decl := range file.Decls {
-		// Only var decl
-		decl, _ := decl.(*ast.GenDecl)
-		if decl == nil || decl.Tok != token.VAR {
-			continue
-		}
-		for _, spec := range decl.Specs {
-			// Only vars w/ comments
-			spec, _ := spec.(*ast.ValueSpec)
-			if spec == nil || spec.Comment == nil || len(spec.Comment.List) != 1 {
-				continue
-			}
-			// Parse dim:ref
-			pieces := strings.SplitN(spec.Comment.List[0].Text, ":", 2)
-			if len(pieces) != 2 {
-				continue
-			}
-			dim, ref := strings.TrimPrefix(pieces[0], "//"), pieces[1]
-			t := d.Config.Transformers[dim]
-			// If no transformer or only "<in>", does not apply to us
-			if t == nil || ref == "<in>" {
-				continue
-			}
-			d.dimensionsSeen[dim] = struct{}{}
-			// The transformer cannot be ignoring this package
-			applies, err := t.AppliesToPackage(
-				&TransformContext{Context: context.Background(), Superpose: d.Superpose, Dimension: dim},
-				importPath,
-			)
-			if err != nil {
-				return err
-			} else if !applies {
-				return fmt.Errorf("dimension %v referenced in package %v, but it is not applied", dim, importPath)
-			}
-
-			// Validate the var decl
-			if len(spec.Names) != 1 {
-				return fmt.Errorf("dimension func vars can only have a single identifier")
-			}
-			funcType, _ := spec.Type.(*ast.FuncType)
-			if funcType == nil {
-				return fmt.Errorf("var %v is not typed with a func", spec.Names[0].Name)
-			} else if len(spec.Values) != 0 {
-				return fmt.Errorf("var %v cannot have default", spec.Names[0].Name)
-			}
-
-			// Find function in same file that is being referenced
-			var funcDecl *ast.FuncDecl
-			for _, maybeFuncDecl := range file.Decls {
-				maybeFuncDecl, _ := maybeFuncDecl.(*ast.FuncDecl)
-				if maybeFuncDecl != nil && maybeFuncDecl.Name.Name == ref && maybeFuncDecl.Recv == nil {
-					funcDecl = maybeFuncDecl
-					break
-				}
-			}
-			if funcDecl == nil {
-				return fmt.Errorf("unable to find func decl %v", ref)
-			}
-
-			// Confirm the signatures are identical (param names and everything). Just
-			// do a string print of the types to confirm.
-			emptyFset := token.NewFileSet()
-			var expected, actual strings.Builder
-			if err := printer.Fprint(&expected, emptyFset, funcType); err != nil {
-				return err
-			} else if err := printer.Fprint(&actual, emptyFset, funcDecl.Type); err != nil {
-				return err
-			} else if expected.String() != actual.String() {
-				return fmt.Errorf("expected var %v to have type %v, instead had %v",
-					spec.Names[0].Name, expected, actual)
-			}
-
-			// Now confirmed, add init statement
-			d.Debugf("Setting var %v to function reference of %v in dimension %v", spec.Names[0].Name, ref, dim)
-			importAlias := d.importAlias(path.Join(importPath, d.DimensionPackage(dim)))
-			d.initStatements = append(d.initStatements,
-				fmt.Sprintf("%v = %v.%v", spec.Names[0].Name, importAlias, ref))
-			anyStatements = true
-		}
-	}
-
-	// We expected at least one
-	if !anyStatements {
-		return fmt.Errorf("no proper dimension references found, though %v referenced", foundDim)
-	}
-	return nil
-}
-
-func (d *dimensionInitBuilder) importAlias(importPath string) string {
-	alias := d.imports[importPath]
-	if alias == "" {
-		alias = fmt.Sprintf("import%v", len(d.imports)+1)
-		d.imports[importPath] = alias
-	}
-	return alias
-}
-
-func (d *dimensionInitBuilder) writeTempInitFile() (string, error) {
-	// Build code
-	code := "package " + d.packageName + "\n\n"
-	for importPath, alias := range d.imports {
-		code += fmt.Sprintf("import %v %q\n", alias, importPath)
-	}
-	code += "\nfunc init() {\n"
-	for _, stmt := range d.initStatements {
-		code += "\t" + stmt + "\n"
-	}
-	code += "}\n"
-
-	// Write to a temp file
-	tmpDir, err := d.UseTempDir()
-	if err != nil {
-		return "", err
-	}
-	f, err := os.CreateTemp(tmpDir, "superpose-*.go")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	d.Debugf("Writing the following code to %v:\n%s\n", f.Name(), code)
-	if _, err := f.Write([]byte(code)); err != nil {
-		return "", err
-	}
-	return f.Name(), nil
-}
-
-func (s *Superpose) compileVersionFull(tool string, args []string) error {
+func (s *Superpose) toolexecVersionFull(tool string, args []string) error {
 	// Go build uses the results of this to know whether to recompile. This is
 	// usually to Go compiler version. We add the user version and our version to
 	// this. Some of this code taken from Garble.
@@ -781,48 +247,51 @@ func (s *Superpose) compileVersionFull(tool string, args []string) error {
 	return nil
 }
 
-func (s *Superpose) updateImportCfgArg(compileArgs []string, newImportMaps []string) error {
-	// Find the importcfg file
-	importCfgIndex := -1
-	for i, arg := range compileArgs {
-		if arg == "-importcfg" && len(compileArgs) >= i {
-			importCfgIndex = i + 1
+type compileFlags struct {
+	// This set includes the compile executable as first arg
+	args                                                               []string
+	outputIndex, trimPathIndex, pkgIndex, buildIDIndex, importCfgIndex int
+	goFileIndexes                                                      map[string]int
+}
+
+func parseCompileFlags(args []string) (*compileFlags, error) {
+	// TODO(cretz): This is brittle because it assumes these flags don't use "="
+	// form which is only based on observation
+	flags := &compileFlags{args: args, goFileIndexes: map[string]int{}}
+	for i, arg := range args {
+		switch arg {
+		case "-o":
+			flags.outputIndex = i + 1
+		case "-trimpath":
+			flags.trimPathIndex = i + 1
+		case "-p":
+			flags.pkgIndex = i + 1
+		case "-buildid":
+			flags.buildIDIndex = i + 1
+		case "-importcfg":
+			flags.importCfgIndex = i + 1
+		default:
+			// Even if not a file but happens to have this suffix, harmless to store
+			// in map anyways
+			if strings.HasSuffix(arg, ".go") {
+				flags.goFileIndexes[arg] = i
+			}
 		}
 	}
-	if importCfgIndex == -1 {
-		return fmt.Errorf("no importcfg argument")
+	// Confirm all present
+	switch {
+	case flags.outputIndex == 0:
+		return nil, fmt.Errorf("missing -o")
+	case flags.trimPathIndex == 0:
+		return nil, fmt.Errorf("missing -trimpath")
+	case flags.pkgIndex == 0:
+		return nil, fmt.Errorf("missing -p")
+	case flags.buildIDIndex == 0:
+		return nil, fmt.Errorf("missing -buildid")
+	case flags.importCfgIndex == 0:
+		return nil, fmt.Errorf("missing -importcfg")
 	}
-
-	// Read existing
-	importCfgBytes, err := os.ReadFile(compileArgs[importCfgIndex])
-	if err != nil {
-		return fmt.Errorf("failed reading importcfg file: %w", err)
-	}
-	importCfg := strings.TrimSpace(string(importCfgBytes))
-	// Go tooling puts a newline at the end, so we will also
-	importCfg += "\n"
-	for _, line := range newImportMaps {
-		importCfg += "importmap " + line + "\n"
-	}
-
-	// Create new temp importcfg
-	tmpDir, err := s.UseTempDir()
-	if err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(tmpDir, "importcfg")
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	// Write the new lines
-	s.Debugf("Copying importcfg from %v to %v and adding import maps: %v",
-		compileArgs[importCfgIndex], f.Name(), newImportMaps)
-	_, err = f.Write([]byte(importCfg))
-	if err == nil {
-		compileArgs[importCfgIndex] = f.Name()
-	}
-	return err
+	return flags, nil
 }
 
 func loadGoToolID(tool string, args []string) (line string, b []byte, err error) {

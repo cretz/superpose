@@ -63,6 +63,7 @@ type Transformer interface {
 	// TODO(cretz): Document that if a package is not applied, its dependencies
 	// aren't either
 	AppliesToPackage(ctx *TransformContext, pkgPath string) (bool, error)
+	// TODO(cretz): Document that the pkg should _not_ be mutated
 	Transform(ctx *TransformContext, pkg *TransformPackage) ([]*Patch, error)
 }
 
