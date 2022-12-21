@@ -17,20 +17,14 @@ type bridgeFile struct {
 	dimPkgRefs map[dimPkgRef]struct{}
 }
 
-type dimPkgRef struct {
-	dim     string
-	pkgPath string
-}
-
 // May return nil file which means no dimensions referenced
-func (s *Superpose) buildBridgeFile(flags *compileFlags) (*bridgeFile, error) {
+func (s *Superpose) buildBridgeFile() (*bridgeFile, error) {
 	// Get dimensions from every file
 	builder := &bridgeFileBuilder{
 		bridgeFile: bridgeFile{dimPkgRefs: map[dimPkgRef]struct{}{}},
-		pkgPath:    flags.args[flags.pkgIndex],
 		imports:    map[string]string{},
 	}
-	for goFile, _ := range flags.goFileIndexes {
+	for goFile := range s.flags.goFileIndexes {
 		if ok, err := s.buildInitStatements(builder, goFile); err != nil {
 			return nil, fmt.Errorf("failed building init statements for file %v: %w", goFile, err)
 		} else if !ok {
@@ -44,7 +38,8 @@ func (s *Superpose) buildBridgeFile(flags *compileFlags) (*bridgeFile, error) {
 		return nil, nil
 	}
 
-	// Build code for the file
+	// Build code for the file. We accept neither the import order nor the init
+	// statement order is deterministic.
 	code := "package " + builder.pkgName + "\n\n"
 	for importPath, alias := range builder.imports {
 		code += fmt.Sprintf("import %v %q\n", alias, importPath)
@@ -75,7 +70,6 @@ func (s *Superpose) buildBridgeFile(flags *compileFlags) (*bridgeFile, error) {
 
 type bridgeFileBuilder struct {
 	bridgeFile
-	pkgPath        string
 	imports        map[string]string
 	initStatements []string
 	// Lazily populated on first file seen
@@ -152,12 +146,12 @@ func (s *Superpose) buildInitStatements(builder *bridgeFileBuilder, goFile strin
 			// The transformer cannot be ignoring this package
 			applies, err := t.AppliesToPackage(
 				&TransformContext{Context: context.Background(), Superpose: s, Dimension: dim},
-				builder.pkgPath,
+				s.pkgPath(),
 			)
 			if err != nil {
 				return false, err
 			} else if !applies {
-				return false, fmt.Errorf("dimension %v referenced in package %v, but it is not applied", dim, builder.pkgPath)
+				return false, fmt.Errorf("dimension %v referenced in package %v, but it is not applied", dim, s.pkgPath())
 			}
 
 			// Validate the var decl
@@ -199,9 +193,8 @@ func (s *Superpose) buildInitStatements(builder *bridgeFileBuilder, goFile strin
 
 			// Now confirmed, add init statement
 			s.Debugf("Setting var %v to function reference of %v in dimension %v", spec.Names[0].Name, ref, dim)
-			dimPkgPath := s.DimensionPackage(builder.pkgPath, dim)
-			builder.dimPkgRefs[dimPkgRef{dim: dim, pkgPath: dimPkgPath}] = struct{}{}
-			importAlias := builder.importAlias(dimPkgPath)
+			builder.dimPkgRefs[dimPkgRef{dim: dim, origPkgPath: s.pkgPath()}] = struct{}{}
+			importAlias := builder.importAlias(s.DimensionPackagePath(s.pkgPath(), dim))
 			builder.initStatements = append(builder.initStatements,
 				fmt.Sprintf("%v = %v.%v", spec.Names[0].Name, importAlias, ref))
 			anyStatements = true

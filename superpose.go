@@ -33,9 +33,14 @@ type Config struct {
 }
 
 type Superpose struct {
-	Config     Config
-	tempDir    string
-	buildCache *cache.Cache
+	Config  Config
+	tempDir string
+	// Only properly set after we know we're at the compile step
+	flags compileFlags
+	// Lazy, use buildCache()
+	_buildCache *cache.Cache
+	// Lazy, use pkgActionIDs()
+	_pkgActionIDs map[string]cache.ActionID
 }
 
 func RunMain(config Config, runConfig RunMainConfig) {
@@ -64,8 +69,8 @@ type RunMainConfig struct {
 func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 	// Cleanup the cache on complete if it's present (meaning it was used)
 	defer func() {
-		if s.buildCache != nil {
-			s.buildCache.Trim()
+		if s._buildCache != nil {
+			s._buildCache.Trim()
 		}
 	}()
 
@@ -175,42 +180,128 @@ func (s *Superpose) Debugf(f string, v ...interface{}) {
 	}
 }
 
-func (s *Superpose) DimensionPackage(origPkg string, dimension string) string {
+func (s *Superpose) DimensionPackagePath(origPkg string, dimension string) string {
 	// Just delimit with two underscores for now
 	return origPkg + "__" + dimension
 }
 
-func (s *Superpose) onCompile(args []string) (newArgs []string, err error) {
-	// Extract flags
-	flags, err := parseCompileFlags(args)
+func (s *Superpose) dimensionPackageActionID(origPkg string, dim string) (cache.ActionID, error) {
+	// Get the original package action ID and make a subkey
+	pkgActionIDs, err := s.pkgActionIDs()
+	pkgActionID, ok := pkgActionIDs[origPkg]
 	if err != nil {
-		return nil, err
+		return pkgActionID, err
+	} else if !ok {
+		return pkgActionID, fmt.Errorf("unable to find action ID for package %v", origPkg)
 	}
-	// Sanity check the package path
-	if pkgPath := os.Getenv("TOOLEXEC_IMPORTPATH"); pkgPath == "" {
-		return nil, fmt.Errorf("no import path found")
-	} else if pkgPath != flags.args[flags.pkgIndex] {
-		// Sanity check
-		return nil, fmt.Errorf("import path is %v but package arg is %v", pkgPath, flags.args[flags.pkgIndex])
+	return cache.Subkey(pkgActionID, "superpose-dimension: "+dim), nil
+}
+
+// Errors or gives string file, never empty string with no error
+func (s *Superpose) dimensionPackageFile(origPkg string, dim string) (string, error) {
+	actionID, err := s.dimensionPackageActionID(origPkg, dim)
+	if err != nil {
+		return "", err
+	}
+	cache, err := s.buildCache()
+	if err != nil {
+		return "", err
+	}
+	file, _, err := cache.GetFile(actionID)
+	if err != nil {
+		return "", fmt.Errorf("failed getting action ID for pkg %v in dimension %v: %w", origPkg, dim, err)
+	}
+	return file, nil
+}
+
+func (s *Superpose) buildCache() (*cache.Cache, error) {
+	if s._buildCache == nil {
+		var err error
+		if s._buildCache, err = cache.Open(s.Config.BuildCacheDir); err != nil {
+			return nil, fmt.Errorf("failed opening build cache at %v: %w", s.Config.BuildCacheDir, err)
+		}
+	}
+	return s._buildCache, nil
+}
+
+func (s *Superpose) onCompile(args []string) (newArgs []string, err error) {
+	// Parse flags
+	if err := s.flags.parse(args); err != nil {
+		return nil, err
 	}
 
 	// Compile dimensions
-	if err := s.compileDimensions(flags); err != nil {
+	if err := s.compileDimensions(); err != nil {
 		return nil, err
 	}
 
-	// Add bridge file to args if any
-	if bridgeFile, err := s.buildBridgeFile(flags); err != nil {
-		return nil, err
-	} else if bridgeFile != nil {
-		args = append(args, bridgeFile.fileName)
-		// TODO(cretz): Make a new import config file to reference all packages seen
-		// in the bridge file
-		panic("TODO")
-		// TODO(cretz): Update build ID for compile to include the init file
-		panic("TODO")
+	// Add bridge file to args if any. If no bridge file, just reuse the same
+	// args.
+	bridgeFile, err := s.buildBridgeFile()
+	if bridgeFile == nil || err != nil {
+		return args, err
 	}
-	return args, nil
+
+	// Now that we know there is a bridge file, copy all the args and add bridge
+	// file to the end
+	newArgs = make([]string, len(args)+1)
+	copy(newArgs, args)
+	newArgs[len(newArgs)-1] = bridgeFile.fileName
+
+	// Also, make a temporary import config with any additional dimension refs
+	newArgs[s.flags.importCfgIndex], err = s.newTempImportCfg(bridgeFile.dimPkgRefs, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed creating bridge importcfg: %w", err)
+	}
+
+	// Note, we don't have to alter the build ID for the compile args because the
+	// build ID already takes into account the global build ID with our version
+	// from -V=full.
+	return newArgs, nil
+}
+
+func (s *Superpose) pkgActionIDs() (map[string]cache.ActionID, error) {
+	if s._pkgActionIDs == nil {
+		// Use "go list" to get action IDs for this package and every dependency
+		b, err := exec.Command(
+			"go", "list", "-f", "{{.ImportPath}}|{{.BuildID}}", "-export", "-deps", s.pkgPath()).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("failed listing packages: %w. Output: %s", err, b)
+		}
+		// Go over each line, breaking out the action ID and the package path
+		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+		s._pkgActionIDs = make(map[string]cache.ActionID, len(lines))
+		for _, line := range lines {
+			lastPipe := strings.LastIndex(line, "|")
+			lastSlash := strings.LastIndex(line, "/")
+			if lastPipe < 0 {
+				return nil, fmt.Errorf("invalid list line: %v", line)
+			}
+			// If there is no slash, there is no action ID
+			if lastSlash < 0 {
+				continue
+			}
+			var pkgActionID cache.ActionID
+			pkgActionIDSlice, err := base64.RawURLEncoding.DecodeString(line[lastSlash+1:])
+			if err != nil {
+				return nil, fmt.Errorf("invalid action ID: %w, list line: %v", err, line)
+			} else if len(pkgActionIDSlice) != len(pkgActionID) {
+				return nil, fmt.Errorf("expected action ID len %v, got %v", len(pkgActionID), len(pkgActionIDSlice))
+			}
+			copy(pkgActionID[:], pkgActionIDSlice)
+			s._pkgActionIDs[line[:lastPipe]] = pkgActionID
+		}
+		// Do a sanity check to confirm this package's action ID matches build ID
+		buildID := s.flags.args[s.flags.buildIDIndex]
+		if buildIDSlashIndex := strings.Index(buildID, "/"); buildIDSlashIndex < 0 {
+			return nil, fmt.Errorf("invalid build ID of %v", buildID)
+		} else if actionID, err := base64.RawURLEncoding.DecodeString(buildID[:buildIDSlashIndex]); err != nil {
+			return nil, fmt.Errorf("failed decoding action ID: %w", err)
+		} else if v := s._pkgActionIDs[s.pkgPath()]; !bytes.Equal(actionID, v[:]) {
+			return nil, fmt.Errorf("expected action ID %v, but package action ID showed as %v", actionID, v)
+		}
+	}
+	return s._pkgActionIDs, nil
 }
 
 func (s *Superpose) toolexecVersionFull(tool string, args []string) error {
@@ -247,6 +338,78 @@ func (s *Superpose) toolexecVersionFull(tool string, args []string) error {
 	return nil
 }
 
+func (s *Superpose) pkgPath() string {
+	return s.flags.args[s.flags.pkgIndex]
+}
+
+type dimPkgRef struct {
+	dim         string
+	origPkgPath string
+}
+
+// If not appendOnly, replaces
+func (s *Superpose) newTempImportCfg(dimPkgs map[dimPkgRef]struct{}, appendOnly bool) (string, error) {
+	// Read existing
+	origImportCfgFile := s.flags.args[s.flags.importCfgIndex]
+	importCfgBytes, err := os.ReadFile(origImportCfgFile)
+	if err != nil {
+		return "", fmt.Errorf("failed reading importcfg file: %w", err)
+	}
+	importCfgLines := strings.Split(strings.TrimSpace(string(importCfgBytes)), "\n")
+
+	// If not append, remove any ones that currently match
+	if !appendOnly {
+		n := 0
+		for _, line := range importCfgLines {
+			// Only keep if not in dimPkgs
+			keep := true
+			if strings.HasPrefix(line, "packagefile ") {
+				pkgPath := line[strings.Index(line, " ")+1 : strings.Index(line, "=")]
+				for dimPkg := range dimPkgs {
+					if dimPkg.origPkgPath == pkgPath {
+						keep = false
+						break
+					}
+				}
+			}
+			if keep {
+				importCfgLines[n] = line
+				n++
+			}
+		}
+		importCfgLines = importCfgLines[:n]
+	}
+
+	// Add all references
+	for dimPkg := range dimPkgs {
+		pkgFile, err := s.dimensionPackageFile(dimPkg.origPkgPath, dimPkg.dim)
+		if err != nil {
+			return "", err
+		}
+		importCfgLines = append(importCfgLines,
+			fmt.Sprintf("packagefile %v=%v", s.DimensionPackagePath(dimPkg.origPkgPath, dimPkg.dim), pkgFile))
+	}
+
+	// Create new temp importcfg
+	tmpDir, err := s.UseTempDir()
+	if err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(tmpDir, "importcfg")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	// Write lines
+	s.Debugf("Copying importcfg from %v to %v and setting dimension packages (append? %v): %#v",
+		origImportCfgFile, f.Name(), appendOnly, dimPkgs)
+	_, err = f.Write([]byte(strings.Join(importCfgLines, "\n") + "\n"))
+	if err != nil {
+		return "", err
+	}
+	return f.Name(), nil
+}
+
 type compileFlags struct {
 	// This set includes the compile executable as first arg
 	args                                                               []string
@@ -254,44 +417,52 @@ type compileFlags struct {
 	goFileIndexes                                                      map[string]int
 }
 
-func parseCompileFlags(args []string) (*compileFlags, error) {
+func (c *compileFlags) parse(args []string) error {
 	// TODO(cretz): This is brittle because it assumes these flags don't use "="
 	// form which is only based on observation
-	flags := &compileFlags{args: args, goFileIndexes: map[string]int{}}
+	c.args = args
+	c.goFileIndexes = map[string]int{}
 	for i, arg := range args {
 		switch arg {
 		case "-o":
-			flags.outputIndex = i + 1
+			c.outputIndex = i + 1
 		case "-trimpath":
-			flags.trimPathIndex = i + 1
+			c.trimPathIndex = i + 1
 		case "-p":
-			flags.pkgIndex = i + 1
+			c.pkgIndex = i + 1
 		case "-buildid":
-			flags.buildIDIndex = i + 1
+			c.buildIDIndex = i + 1
 		case "-importcfg":
-			flags.importCfgIndex = i + 1
+			c.importCfgIndex = i + 1
 		default:
 			// Even if not a file but happens to have this suffix, harmless to store
 			// in map anyways
 			if strings.HasSuffix(arg, ".go") {
-				flags.goFileIndexes[arg] = i
+				c.goFileIndexes[arg] = i
 			}
 		}
 	}
 	// Confirm all present
 	switch {
-	case flags.outputIndex == 0:
-		return nil, fmt.Errorf("missing -o")
-	case flags.trimPathIndex == 0:
-		return nil, fmt.Errorf("missing -trimpath")
-	case flags.pkgIndex == 0:
-		return nil, fmt.Errorf("missing -p")
-	case flags.buildIDIndex == 0:
-		return nil, fmt.Errorf("missing -buildid")
-	case flags.importCfgIndex == 0:
-		return nil, fmt.Errorf("missing -importcfg")
+	case c.outputIndex == 0:
+		return fmt.Errorf("missing -o")
+	case c.trimPathIndex == 0:
+		return fmt.Errorf("missing -trimpath")
+	case c.pkgIndex == 0:
+		return fmt.Errorf("missing -p")
+	case c.buildIDIndex == 0:
+		return fmt.Errorf("missing -buildid")
+	case c.importCfgIndex == 0:
+		return fmt.Errorf("missing -importcfg")
 	}
-	return flags, nil
+	// Sanity check the package path
+	if pkgPath := os.Getenv("TOOLEXEC_IMPORTPATH"); pkgPath == "" {
+		return fmt.Errorf("no import path found")
+	} else if pkgPath != args[c.pkgIndex] {
+		// Sanity check
+		return fmt.Errorf("import path is %v but package arg is %v", pkgPath, args[c.pkgIndex])
+	}
+	return nil
 }
 
 func loadGoToolID(tool string, args []string) (line string, b []byte, err error) {
@@ -348,32 +519,4 @@ func fetchExeContentID() ([]byte, error) {
 		}
 	}
 	return exeContentID, nil
-}
-
-func loadPackageActionIDs(initialPackage string) (map[string][]byte, error) {
-	// Use "go list" to get action IDs for this package and every dependency
-	b, err := exec.Command(
-		"go", "list", "-f", "{{.ImportPath}}|{{.BuildID}}", "-export", "-deps", initialPackage).CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("failed listing packages: %w. Output: %s", err, b)
-	}
-	// Go over each line, breaking out the action ID and the package path
-	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-	packageActionIDs := make(map[string][]byte, len(lines))
-	for _, line := range lines {
-		lastPipe := strings.LastIndex(line, "|")
-		lastSlash := strings.LastIndex(line, "/")
-		if lastPipe < 0 {
-			return nil, fmt.Errorf("invalid list line: %v", line)
-		}
-		// If there is no slash, there is no action ID
-		if lastSlash < 0 {
-			continue
-		}
-		packageActionIDs[line[:lastPipe]], err = base64.RawURLEncoding.DecodeString(line[lastSlash+1:])
-		if err != nil {
-			return nil, fmt.Errorf("invalid action ID: %w, list line: %v", err, line)
-		}
-	}
-	return packageActionIDs, nil
 }
