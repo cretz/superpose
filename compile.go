@@ -28,9 +28,11 @@ func (s *Superpose) compileDimensions() error {
 
 		// Only add the transformer if there is an error getting the cached file
 		// (meaning it is not in cache or other issue)
-		_, fileCheckErr := s.dimDepPkgFile(s.pkgPath, dim)
+		file, fileCheckErr := s.dimDepPkgFile(s.pkgPath, dim)
 		if fileCheckErr != nil {
 			transformers[dim] = t
+		} else {
+			s.Debugf("Skipping compiling %v in dimension %v, already cached at %v", s.pkgPath, dim, file)
 		}
 	}
 
@@ -90,7 +92,7 @@ func (s *Superpose) compileDimensions() error {
 			return fmt.Errorf("failed transforming %v to dimension %v: %w", s.pkgPath, dim, err)
 		}
 
-		// Patch imports and package name
+		// Patch imports
 		importPatches, dimPkgRefs, err := s.transformImports(ctx, pkg)
 		if err != nil {
 			return err
@@ -103,6 +105,11 @@ func (s *Superpose) compileDimensions() error {
 			return err
 		}
 		transformed.Patches = append(transformed.Patches, boolVarPatches...)
+
+		// Patch line directives
+		if err := s.addLineDirectives(ctx, pkg, transformed); err != nil {
+			return err
+		}
 
 		// Compile the patches. Even if there aren't any, we need to perform the
 		// compilation.
@@ -181,6 +188,15 @@ func (s *Superpose) transformInBoolVars(ctx *TransformContext, pkg *packages.Pac
 		}
 	}
 	return patches, nil
+}
+
+func (s *Superpose) addLineDirectives(
+	ctx *TransformContext,
+	pkg *packages.Package,
+	transformed *TransformResult,
+) error {
+	// TODO(cretz): This
+	return nil
 }
 
 func (s *Superpose) compilePatches(
@@ -282,5 +298,14 @@ func (s *Superpose) compilePatches(
 	if err != nil {
 		return err
 	}
-	return cache.PutBytes(s.buildActionIDToCacheActionID(actionID), b)
+	if err := cache.PutBytes(s.buildActionIDToCacheActionID(actionID), b); err != nil {
+		return err
+	}
+
+	// Also put metadata in cache
+	metadata := &dimPkgMetadata{IncludeDependentPackages: make([]string, 0, len(transformed.IncludeDependentPackages))}
+	for depPkg := range transformed.IncludeDependentPackages {
+		metadata.IncludeDependentPackages = append(metadata.IncludeDependentPackages, depPkg)
+	}
+	return s.setDimPkgMetadata(actionID, metadata)
 }

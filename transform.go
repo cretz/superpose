@@ -15,7 +15,7 @@ import (
 
 type Transformer interface {
 	// TODO(cretz): Document that if a package is not applied, its dependencies
-	// aren't either
+	// aren't either. Also that this needs to be cheap, it's called lots.
 	AppliesToPackage(ctx *TransformContext, pkgPath string) (bool, error)
 	// TODO(cretz): Document that the pkg should _not_ be mutated and that the
 	// result may be mutated by the system

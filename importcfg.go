@@ -31,6 +31,12 @@ func (i *importCfg) removePkgFile(pkgPath string) bool {
 }
 
 func (i *importCfg) addPkgFile(pkgPath string, pkgFile string) {
+	// We only add if not already there
+	for _, line := range i.lines {
+		if strings.HasPrefix(line, "packagefile "+pkgPath+"=") {
+			return
+		}
+	}
 	i.lines = append(i.lines, fmt.Sprintf("packagefile %v=%v", pkgPath, pkgFile))
 }
 
@@ -69,6 +75,17 @@ func (i *importCfg) updateDimPkgRefs(d dimPkgRefs, replace bool) error {
 	return nil
 }
 
+func (i *importCfg) buildContent() string {
+	// We add a newline at the end like Go does
+	return strings.Join(i.lines, "\n") + "\n"
+}
+
+func (i *importCfg) writeFile(file string) error {
+	content := i.buildContent()
+	i.s.Debugf("Writing importcfg to %v with content:\n%v", file, content)
+	return os.WriteFile(file, []byte(content), 0666)
+}
+
 func (i *importCfg) writeTempFile() (string, error) {
 	tmpDir, err := i.s.UseTempDir()
 	if err != nil {
@@ -79,9 +96,8 @@ func (i *importCfg) writeTempFile() (string, error) {
 		return "", err
 	}
 	defer f.Close()
-	content := strings.Join(i.lines, "\n") + "\n"
+	content := i.buildContent()
 	i.s.Debugf("Writing importcfg to %v with content:\n%v", f.Name(), content)
-	// We add a newline at the end like Go does
 	_, err = f.Write([]byte(content))
 	if err != nil {
 		return "", err

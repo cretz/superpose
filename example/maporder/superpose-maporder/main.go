@@ -11,7 +11,7 @@ import (
 func main() {
 	superpose.RunMain(
 		superpose.Config{
-			Version: "1",
+			Version: "2",
 			Transformers: map[string]superpose.Transformer{
 				// Transform both of these dimensions
 				"maporder_sorted": &transformer{sorted: true},
@@ -65,7 +65,10 @@ func (t *transformer) Transform(
 				Range: superpose.Range{Pos: file.Name.End()},
 				Str:   fmt.Sprintf("; import %s %q", mapIterAlias, mapIterPkg),
 			})
-			res.IncludeDependentPackages = map[string]struct{}{mapIterPkg: {}}
+			res.IncludeDependentPackages = map[string]struct{}{
+				mapIterPkg:                     {},
+				"golang.org/x/exp/constraints": {},
+			}
 		}
 	}
 	return res, nil

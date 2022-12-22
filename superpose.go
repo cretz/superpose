@@ -2,8 +2,10 @@ package superpose
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"hash"
@@ -159,13 +161,18 @@ func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 	}
 
 	s.Debugf("Intercepting toolexec with args: %v", args)
-	if tool == "compile" {
+	switch tool {
+	case "compile":
 		var err error
 		if args, err = s.onCompile(args); err != nil {
 			return err
 		}
 		s.Debugf("Updated compile args to %v", args)
-	} else {
+	case "link":
+		if err := s.onLink(args); err != nil {
+			return err
+		}
+	default:
 		s.Debugf("No interception needed for tool %v", tool)
 	}
 
@@ -222,12 +229,12 @@ func (s *Superpose) onCompile(args []string) (newArgs []string, err error) {
 	copy(newArgs, args)
 	newArgs[len(newArgs)-1] = bridgeFile.fileName
 
-	// Also, make a temporary import config with any additional dimension refs
+	// Update import cfg to include the dimension package references
 	if importCfg, err := s.loadImportCfg(newArgs[s.flags.importCfgIndex]); err != nil {
 		return nil, fmt.Errorf("failed loading import cfg for bridge: %w", err)
 	} else if err := importCfg.updateDimPkgRefs(bridgeFile.dimPkgRefs, false); err != nil {
 		return nil, fmt.Errorf("failed updating dim package refs in bridge import cfg: %w", err)
-	} else if newArgs[s.flags.importCfgIndex], err = importCfg.writeTempFile(); err != nil {
+	} else if err := importCfg.writeFile(newArgs[s.flags.importCfgIndex]); err != nil {
 		return nil, fmt.Errorf("failed creating bridge import cfg: %w", err)
 	}
 
@@ -235,6 +242,76 @@ func (s *Superpose) onCompile(args []string) (newArgs []string, err error) {
 	// build ID already takes into account the global build ID with our version
 	// from -V=full.
 	return newArgs, nil
+}
+
+func (s *Superpose) onLink(args []string) error {
+	// Go over every package file in the import cfg and add entries for every
+	// missing dimension reference.
+
+	// Load the import config
+	var importCfgFile string
+	for i, arg := range args {
+		if arg == "-importcfg" {
+			importCfgFile = args[i+1]
+			break
+		}
+	}
+	if importCfgFile == "" {
+		return fmt.Errorf("no import cfg file for link")
+	}
+	importCfg, err := s.loadImportCfg(importCfgFile)
+	if err != nil {
+		return fmt.Errorf("failed loading link import cfg: %w", err)
+	}
+
+	// Walk every line, collecting dimension equivalents
+	dimPkgRefs := dimPkgRefs{}
+	for _, line := range importCfg.lines {
+		if !strings.HasPrefix(line, "packagefile ") {
+			continue
+		}
+		origPkgPath := strings.TrimPrefix(line[:strings.Index(line, "=")], "packagefile ")
+		for dim, t := range s.Config.Transformers {
+			// Confirm applies
+			applies, err := t.AppliesToPackage(
+				&TransformContext{Context: context.Background(), Superpose: s, Dimension: dim}, origPkgPath)
+			if err != nil {
+				return fmt.Errorf("failed determining whether package %v applies during link: %w", origPkgPath, err)
+			} else if !applies {
+				continue
+			}
+
+			// Load metadata for the package
+			actionID, err := s.dimDepPkgActionID(origPkgPath, dim)
+			if err != nil {
+				return err
+			}
+			metadata, err := s.getDimPkgMetadata(actionID)
+			if err != nil {
+				return fmt.Errorf("failed getting metadata for package %v in dimension %v: %w", origPkgPath, dim, err)
+			}
+
+			// Add the reference to import cfg
+			dimPkgRefs.addRef(origPkgPath, dim)
+
+			// Include dependent packages
+			for _, depPkg := range metadata.IncludeDependentPackages {
+				if err := importCfg.includePkg(depPkg); err != nil {
+					return fmt.Errorf("failed including dependent %v package for package %v in dimension %v: %w",
+						depPkg, origPkgPath, dim, err)
+				}
+			}
+		}
+	}
+
+	// If there are any dimension references, update import cfg
+	if len(dimPkgRefs) > 0 {
+		if err := importCfg.updateDimPkgRefs(dimPkgRefs, false); err != nil {
+			return fmt.Errorf("failed updating dim package refs for link: %w", err)
+		}
+		return importCfg.writeFile(importCfgFile)
+	}
+	return nil
 }
 
 func (s *Superpose) dimDepPkgActionID(origPkg string, dim string) ([]byte, error) {
@@ -251,6 +328,8 @@ func (s *Superpose) dimDepPkgActionID(origPkg string, dim string) ([]byte, error
 	s.hash.Write(pkgActionID)
 	s.hash.Write([]byte("/superpose/"))
 	s.hash.Write([]byte(dim))
+	s.hash.Write([]byte("/"))
+	s.hash.Write([]byte(s.Config.Version))
 	return s.hash.Sum(nil)[:len(pkgActionID)], nil
 }
 
@@ -285,6 +364,46 @@ func (s *Superpose) pkgFile(pkgPath string) (string, error) {
 		return "", fmt.Errorf("no package file export for %v", pkgPath)
 	}
 	return ret, nil
+}
+
+type dimPkgMetadata struct {
+	IncludeDependentPackages []string `json:"includeDependentPackages"`
+}
+
+func (s *Superpose) getDimPkgMetadata(actionID []byte) (*dimPkgMetadata, error) {
+	cache, err := s.buildCache()
+	if err != nil {
+		return nil, err
+	}
+	b, _, err := cache.GetBytes(s.dimPkgMetadataCacheID(actionID))
+	if err != nil {
+		return nil, err
+	}
+	var metadata dimPkgMetadata
+	if err := json.Unmarshal(b, &metadata); err != nil {
+		return nil, err
+	}
+	return &metadata, nil
+}
+
+func (s *Superpose) setDimPkgMetadata(actionID []byte, metadata *dimPkgMetadata) error {
+	b, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	cache, err := s.buildCache()
+	if err != nil {
+		return err
+	}
+	return cache.PutBytes(s.dimPkgMetadataCacheID(actionID), b)
+}
+
+func (s *Superpose) dimPkgMetadataCacheID(actionID []byte) (cacheActionID cache.ActionID) {
+	s.hash.Reset()
+	s.hash.Write(actionID)
+	s.hash.Write([]byte("/superpose/metadata"))
+	s.hash.Sum(cacheActionID[:0])
+	return
 }
 
 func (s *Superpose) buildActionIDToCacheActionID(buildActionID []byte) (cacheActionID cache.ActionID) {
