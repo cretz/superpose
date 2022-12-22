@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"flag"
 	"fmt"
+	"hash"
 	"log"
 	"os"
 	"os/exec"
@@ -27,20 +28,22 @@ type Config struct {
 	// By default this is <user-cache>/superpose-build
 	BuildCacheDir string
 
-	// TODO(cretz): Allow customizing of load mode. If NeedDeps is present, import
-	// packages could be reused instead of running load per package.
+	// TODO(cretz): Allow customizing of load mode? Per transformer?
 	// LoadMode: packages.LoadMode
 }
 
 type Superpose struct {
 	Config  Config
-	tempDir string
+	pkgPath string
 	// Only properly set after we know we're at the compile step
 	flags compileFlags
+	hash  hash.Hash
 	// Lazy, use buildCache()
 	_buildCache *cache.Cache
-	// Lazy, use pkgActionIDs()
-	_pkgActionIDs map[string]cache.ActionID
+	// Lazy, use depPkgActionIDs()
+	_depPkgActionIDs map[string][]byte
+	// Lazy, use UseTempDir()
+	_tempDir string
 }
 
 func RunMain(config Config, runConfig RunMainConfig) {
@@ -56,8 +59,14 @@ func New(config Config) (*Superpose, error) {
 		return nil, fmt.Errorf("version required")
 	} else if len(config.Transformers) == 0 {
 		return nil, fmt.Errorf("at least one transformer required")
+	} else if sha256.Size != cache.HashSize {
+		return nil, fmt.Errorf("cache library no longer uses expected hash size")
 	}
-	return &Superpose{Config: config}, nil
+	return &Superpose{
+		Config:  config,
+		pkgPath: os.Getenv("TOOLEXEC_IMPORTPATH"),
+		hash:    sha256.New(),
+	}, nil
 }
 
 type RunMainConfig struct {
@@ -76,9 +85,9 @@ func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 
 	// Remove temp dir if present on complete and we're not retaining
 	defer func() {
-		if !s.Config.RetainTempDir && s.tempDir != "" {
-			if err := os.RemoveAll(s.tempDir); err != nil {
-				log.Printf("Warning, unable to remove temp dir %v", s.tempDir)
+		if !s.Config.RetainTempDir && s._tempDir != "" {
+			if err := os.RemoveAll(s._tempDir); err != nil {
+				log.Printf("Warning, unable to remove temp dir %v", s._tempDir)
 			}
 		}
 	}()
@@ -144,34 +153,38 @@ func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 		return s.toolexecVersionFull(tool, args)
 	}
 
+	// Henceforth, we expect a package
+	if s.pkgPath == "" {
+		return fmt.Errorf("no TOOLEXEC_IMPORTPATH env var")
+	}
+
 	s.Debugf("Intercepting toolexec with args: %v", args)
-	goToolArgs := args[1:]
 	if tool == "compile" {
 		var err error
-		if goToolArgs, err = s.onCompile(goToolArgs); err != nil {
+		if args, err = s.onCompile(args); err != nil {
 			return err
 		}
-		s.Debugf("Updated compile args to %v", goToolArgs)
+		s.Debugf("Updated compile args to %v", args)
 	} else {
 		s.Debugf("No interception needed for tool %v", tool)
 	}
 
 	// Run the command
-	cmd := exec.Command(args[0], goToolArgs...)
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-// Not concurrency safe
+// Not concurrency safe.
 func (s *Superpose) UseTempDir() (string, error) {
-	if s.tempDir == "" {
+	if s._tempDir == "" {
 		var err error
-		if s.tempDir, err = os.MkdirTemp("", "superpose-build-"); err != nil {
+		if s._tempDir, err = os.MkdirTemp("", "superpose-build-"); err != nil {
 			return "", err
 		}
 	}
-	return s.tempDir, nil
+	return s._tempDir, nil
 }
 
 func (s *Superpose) Debugf(f string, v ...interface{}) {
@@ -183,45 +196,6 @@ func (s *Superpose) Debugf(f string, v ...interface{}) {
 func (s *Superpose) DimensionPackagePath(origPkg string, dimension string) string {
 	// Just delimit with two underscores for now
 	return origPkg + "__" + dimension
-}
-
-func (s *Superpose) dimensionPackageActionID(origPkg string, dim string) (cache.ActionID, error) {
-	// Get the original package action ID and make a subkey
-	pkgActionIDs, err := s.pkgActionIDs()
-	pkgActionID, ok := pkgActionIDs[origPkg]
-	if err != nil {
-		return pkgActionID, err
-	} else if !ok {
-		return pkgActionID, fmt.Errorf("unable to find action ID for package %v", origPkg)
-	}
-	return cache.Subkey(pkgActionID, "superpose-dimension: "+dim), nil
-}
-
-// Errors or gives string file, never empty string with no error
-func (s *Superpose) dimensionPackageFile(origPkg string, dim string) (string, error) {
-	actionID, err := s.dimensionPackageActionID(origPkg, dim)
-	if err != nil {
-		return "", err
-	}
-	cache, err := s.buildCache()
-	if err != nil {
-		return "", err
-	}
-	file, _, err := cache.GetFile(actionID)
-	if err != nil {
-		return "", fmt.Errorf("failed getting action ID for pkg %v in dimension %v: %w", origPkg, dim, err)
-	}
-	return file, nil
-}
-
-func (s *Superpose) buildCache() (*cache.Cache, error) {
-	if s._buildCache == nil {
-		var err error
-		if s._buildCache, err = cache.Open(s.Config.BuildCacheDir); err != nil {
-			return nil, fmt.Errorf("failed opening build cache at %v: %w", s.Config.BuildCacheDir, err)
-		}
-	}
-	return s._buildCache, nil
 }
 
 func (s *Superpose) onCompile(args []string) (newArgs []string, err error) {
@@ -249,9 +223,12 @@ func (s *Superpose) onCompile(args []string) (newArgs []string, err error) {
 	newArgs[len(newArgs)-1] = bridgeFile.fileName
 
 	// Also, make a temporary import config with any additional dimension refs
-	newArgs[s.flags.importCfgIndex], err = s.newTempImportCfg(bridgeFile.dimPkgRefs, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed creating bridge importcfg: %w", err)
+	if importCfg, err := s.loadImportCfg(newArgs[s.flags.importCfgIndex]); err != nil {
+		return nil, fmt.Errorf("failed loading import cfg for bridge: %w", err)
+	} else if err := importCfg.updateDimPkgRefs(bridgeFile.dimPkgRefs, false); err != nil {
+		return nil, fmt.Errorf("failed updating dim package refs in bridge import cfg: %w", err)
+	} else if newArgs[s.flags.importCfgIndex], err = importCfg.writeTempFile(); err != nil {
+		return nil, fmt.Errorf("failed creating bridge import cfg: %w", err)
 	}
 
 	// Note, we don't have to alter the build ID for the compile args because the
@@ -260,48 +237,121 @@ func (s *Superpose) onCompile(args []string) (newArgs []string, err error) {
 	return newArgs, nil
 }
 
-func (s *Superpose) pkgActionIDs() (map[string]cache.ActionID, error) {
-	if s._pkgActionIDs == nil {
+func (s *Superpose) dimDepPkgActionID(origPkg string, dim string) ([]byte, error) {
+	// Get the original package action ID and make a subkey
+	pkgActionIDs, err := s.depPkgActionIDs()
+	if err != nil {
+		return nil, err
+	}
+	pkgActionID, ok := pkgActionIDs[origPkg]
+	if !ok {
+		return nil, fmt.Errorf("unable to find action ID for package %v", origPkg)
+	}
+	s.hash.Reset()
+	s.hash.Write(pkgActionID)
+	s.hash.Write([]byte("/superpose/"))
+	s.hash.Write([]byte(dim))
+	return s.hash.Sum(nil)[:len(pkgActionID)], nil
+}
+
+// Errors or gives string file, never empty string with no error
+func (s *Superpose) dimDepPkgFile(origPkg string, dim string) (string, error) {
+	actionID, err := s.dimDepPkgActionID(origPkg, dim)
+	if err != nil {
+		return "", err
+	}
+	cache, err := s.buildCache()
+	if err != nil {
+		return "", err
+	}
+	// An action ID for cache purposes is not the same as the package action ID
+	// from the package build ID
+	file, _, err := cache.GetFile(s.buildActionIDToCacheActionID(actionID))
+	if err != nil {
+		return "", fmt.Errorf("failed getting action ID for pkg %v in dimension %v: %w", origPkg, dim, err)
+	}
+	return file, nil
+}
+
+// Errors or gives string file, never empty string with no error
+func (s *Superpose) pkgFile(pkgPath string) (string, error) {
+	cmd := exec.Command("go", "list", "-f", "{{.Export}}", "-export", pkgPath)
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed getting export for %v: %w. Output: %s", pkgPath, err, b)
+	}
+	ret := strings.TrimSpace(string(b))
+	if ret == "" {
+		return "", fmt.Errorf("no package file export for %v", pkgPath)
+	}
+	return ret, nil
+}
+
+func (s *Superpose) buildActionIDToCacheActionID(buildActionID []byte) (cacheActionID cache.ActionID) {
+	// Just re-hash
+	s.hash.Reset()
+	s.hash.Write(buildActionID)
+	s.hash.Write([]byte("/superpose"))
+	s.hash.Sum(cacheActionID[:0])
+	return
+}
+
+func (s *Superpose) buildCache() (*cache.Cache, error) {
+	if s._buildCache == nil {
+		// Use subdir of user cache dir if not set
+		cacheDir := s.Config.BuildCacheDir
+		if cacheDir == "" {
+			userCacheDir, err := os.UserCacheDir()
+			if err != nil {
+				return nil, fmt.Errorf("failed getting user cache dir: %w", err)
+			}
+			cacheDir = filepath.Join(userCacheDir, "superpose-build")
+		}
+		// Create the dir if not present
+		if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
+			if err := os.MkdirAll(cacheDir, 0777); err != nil {
+				return nil, fmt.Errorf("failed creating cache dir: %w", err)
+			}
+		}
+		var err error
+		if s._buildCache, err = cache.Open(cacheDir); err != nil {
+			return nil, fmt.Errorf("failed opening build cache at %v: %w", cacheDir, err)
+		}
+	}
+	return s._buildCache, nil
+}
+
+func (s *Superpose) depPkgActionIDs() (map[string][]byte, error) {
+	if s._depPkgActionIDs == nil {
 		// Use "go list" to get action IDs for this package and every dependency
-		b, err := exec.Command(
-			"go", "list", "-f", "{{.ImportPath}}|{{.BuildID}}", "-export", "-deps", s.pkgPath()).CombinedOutput()
+		cmd := exec.Command("go", "list", "-f", "{{.ImportPath}}|{{.BuildID}}", "-export", "-deps", s.pkgPath)
+		b, err := cmd.CombinedOutput()
 		if err != nil {
 			return nil, fmt.Errorf("failed listing packages: %w. Output: %s", err, b)
 		}
 		// Go over each line, breaking out the action ID and the package path
 		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
-		s._pkgActionIDs = make(map[string]cache.ActionID, len(lines))
+		pkgActionIDs := make(map[string][]byte, len(lines))
 		for _, line := range lines {
 			lastPipe := strings.LastIndex(line, "|")
-			lastSlash := strings.LastIndex(line, "/")
 			if lastPipe < 0 {
 				return nil, fmt.Errorf("invalid list line: %v", line)
 			}
+			afterPipeSlash := strings.Index(line[lastPipe:], "/")
 			// If there is no slash, there is no action ID
-			if lastSlash < 0 {
+			if afterPipeSlash < 0 {
 				continue
 			}
-			var pkgActionID cache.ActionID
-			pkgActionIDSlice, err := base64.RawURLEncoding.DecodeString(line[lastSlash+1:])
+			afterPipeSlash += lastPipe
+			pkgActionID, err := base64.RawURLEncoding.DecodeString(line[lastPipe+1 : afterPipeSlash])
 			if err != nil {
 				return nil, fmt.Errorf("invalid action ID: %w, list line: %v", err, line)
-			} else if len(pkgActionIDSlice) != len(pkgActionID) {
-				return nil, fmt.Errorf("expected action ID len %v, got %v", len(pkgActionID), len(pkgActionIDSlice))
 			}
-			copy(pkgActionID[:], pkgActionIDSlice)
-			s._pkgActionIDs[line[:lastPipe]] = pkgActionID
+			pkgActionIDs[line[:lastPipe]] = pkgActionID
 		}
-		// Do a sanity check to confirm this package's action ID matches build ID
-		buildID := s.flags.args[s.flags.buildIDIndex]
-		if buildIDSlashIndex := strings.Index(buildID, "/"); buildIDSlashIndex < 0 {
-			return nil, fmt.Errorf("invalid build ID of %v", buildID)
-		} else if actionID, err := base64.RawURLEncoding.DecodeString(buildID[:buildIDSlashIndex]); err != nil {
-			return nil, fmt.Errorf("failed decoding action ID: %w", err)
-		} else if v := s._pkgActionIDs[s.pkgPath()]; !bytes.Equal(actionID, v[:]) {
-			return nil, fmt.Errorf("expected action ID %v, but package action ID showed as %v", actionID, v)
-		}
+		s._depPkgActionIDs = pkgActionIDs
 	}
-	return s._pkgActionIDs, nil
+	return s._depPkgActionIDs, nil
 }
 
 func (s *Superpose) toolexecVersionFull(tool string, args []string) error {
@@ -324,90 +374,18 @@ func (s *Superpose) toolexecVersionFull(tool string, args []string) error {
 	// Build a hash of slash-delimited Go tool ID + this executable's content ID +
 	// user version
 	// TODO(cretz): What about additional flags here?
-	h := sha256.New()
-	h.Write(goToolID)
-	h.Write([]byte("/"))
-	h.Write(exeContentID)
-	h.Write([]byte("/"))
-	h.Write([]byte(s.Config.Version))
+	s.hash.Reset()
+	s.hash.Write(goToolID)
+	s.hash.Write([]byte("/superpose/"))
+	s.hash.Write(exeContentID)
+	s.hash.Write([]byte("/"))
+	s.hash.Write([]byte(s.Config.Version))
 	// Go only allows a certain size
-	contentID := base64.RawURLEncoding.EncodeToString(h.Sum(nil)[:15])
+	contentID := base64.RawURLEncoding.EncodeToString(s.hash.Sum(nil)[:15])
 
 	// Append content ID as end of fake build ID
 	fmt.Printf("%s +superpose buildID=_/_/_/%s\n", goOutLine, contentID)
 	return nil
-}
-
-func (s *Superpose) pkgPath() string {
-	return s.flags.args[s.flags.pkgIndex]
-}
-
-type dimPkgRef struct {
-	dim         string
-	origPkgPath string
-}
-
-// If not appendOnly, replaces
-func (s *Superpose) newTempImportCfg(dimPkgs map[dimPkgRef]struct{}, appendOnly bool) (string, error) {
-	// Read existing
-	origImportCfgFile := s.flags.args[s.flags.importCfgIndex]
-	importCfgBytes, err := os.ReadFile(origImportCfgFile)
-	if err != nil {
-		return "", fmt.Errorf("failed reading importcfg file: %w", err)
-	}
-	importCfgLines := strings.Split(strings.TrimSpace(string(importCfgBytes)), "\n")
-
-	// If not append, remove any ones that currently match
-	if !appendOnly {
-		n := 0
-		for _, line := range importCfgLines {
-			// Only keep if not in dimPkgs
-			keep := true
-			if strings.HasPrefix(line, "packagefile ") {
-				pkgPath := line[strings.Index(line, " ")+1 : strings.Index(line, "=")]
-				for dimPkg := range dimPkgs {
-					if dimPkg.origPkgPath == pkgPath {
-						keep = false
-						break
-					}
-				}
-			}
-			if keep {
-				importCfgLines[n] = line
-				n++
-			}
-		}
-		importCfgLines = importCfgLines[:n]
-	}
-
-	// Add all references
-	for dimPkg := range dimPkgs {
-		pkgFile, err := s.dimensionPackageFile(dimPkg.origPkgPath, dimPkg.dim)
-		if err != nil {
-			return "", err
-		}
-		importCfgLines = append(importCfgLines,
-			fmt.Sprintf("packagefile %v=%v", s.DimensionPackagePath(dimPkg.origPkgPath, dimPkg.dim), pkgFile))
-	}
-
-	// Create new temp importcfg
-	tmpDir, err := s.UseTempDir()
-	if err != nil {
-		return "", err
-	}
-	f, err := os.CreateTemp(tmpDir, "importcfg")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	// Write lines
-	s.Debugf("Copying importcfg from %v to %v and setting dimension packages (append? %v): %#v",
-		origImportCfgFile, f.Name(), appendOnly, dimPkgs)
-	_, err = f.Write([]byte(strings.Join(importCfgLines, "\n") + "\n"))
-	if err != nil {
-		return "", err
-	}
-	return f.Name(), nil
 }
 
 type compileFlags struct {
@@ -454,13 +432,6 @@ func (c *compileFlags) parse(args []string) error {
 		return fmt.Errorf("missing -buildid")
 	case c.importCfgIndex == 0:
 		return fmt.Errorf("missing -importcfg")
-	}
-	// Sanity check the package path
-	if pkgPath := os.Getenv("TOOLEXEC_IMPORTPATH"); pkgPath == "" {
-		return fmt.Errorf("no import path found")
-	} else if pkgPath != args[c.pkgIndex] {
-		// Sanity check
-		return fmt.Errorf("import path is %v but package arg is %v", pkgPath, args[c.pkgIndex])
 	}
 	return nil
 }

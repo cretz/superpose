@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/rogpeppe/go-internal/cache"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -21,7 +20,7 @@ func (s *Superpose) compileDimensions() error {
 	for dim, t := range s.Config.Transformers {
 		ctx := &TransformContext{Context: context.Background(), Superpose: s, Dimension: dim}
 		// Confirm it applies to this package
-		if applies, err := t.AppliesToPackage(ctx, s.pkgPath()); err != nil {
+		if applies, err := t.AppliesToPackage(ctx, s.pkgPath); err != nil {
 			return err
 		} else if !applies {
 			continue
@@ -29,7 +28,7 @@ func (s *Superpose) compileDimensions() error {
 
 		// Only add the transformer if there is an error getting the cached file
 		// (meaning it is not in cache or other issue)
-		_, fileCheckErr := s.dimensionPackageFile(s.pkgPath(), dim)
+		_, fileCheckErr := s.dimDepPkgFile(s.pkgPath, dim)
 		if fileCheckErr != nil {
 			transformers[dim] = t
 		}
@@ -53,7 +52,7 @@ func (s *Superpose) compileDimensions() error {
 			Logf:  packagesLogf,
 			Tests: true,
 		},
-		s.pkgPath(),
+		s.pkgPath,
 	)
 	if err != nil || len(pkgs) == 0 {
 		return err
@@ -62,23 +61,23 @@ func (s *Superpose) compileDimensions() error {
 	for _, maybePkg := range pkgs {
 		// We'll debug-print any errors encountered, but we won't fail the build,
 		// we'll let the downstream Go compiler give those errors
-		if len(pkg.Errors) > 0 {
-			for i, err := range pkg.Errors {
-				s.Debugf("Failed loading package %v, error #%v: %v", s.pkgPath(), i+1, err)
+		if len(maybePkg.Errors) > 0 {
+			for i, err := range maybePkg.Errors {
+				s.Debugf("Failed loading package %v, error #%v: %v", s.pkgPath, i+1, err)
 			}
 			return nil
 		}
-		if maybePkg.PkgPath == s.pkgPath() {
+		if maybePkg.PkgPath == s.pkgPath {
 			// Sanity check
 			if pkg != nil {
-				return fmt.Errorf("package %v found twice", s.pkgPath())
+				return fmt.Errorf("package %v found twice", s.pkgPath)
 			}
 			pkg = maybePkg
 			break
 		}
 	}
 	if pkg == nil {
-		return fmt.Errorf("package %v not found amongst %v loaded", s.pkgPath(), len(pkgs))
+		return fmt.Errorf("package %v not found amongst %v loaded", s.pkgPath, len(pkgs))
 	}
 
 	// Perform transformation and compilation for each dimension
@@ -86,9 +85,9 @@ func (s *Superpose) compileDimensions() error {
 		ctx := &TransformContext{Context: context.Background(), Superpose: s, Dimension: dim}
 
 		// Collect user-defined patches
-		userPatches, err := transformer.Transform(ctx, &TransformPackage{pkg})
+		transformed, err := transformer.Transform(ctx, &TransformPackage{pkg})
 		if err != nil {
-			return fmt.Errorf("failed transforming %v to dimension %v: %w", s.pkgPath(), dim, err)
+			return fmt.Errorf("failed transforming %v to dimension %v: %w", s.pkgPath, dim, err)
 		}
 
 		// Patch imports and package name
@@ -96,18 +95,19 @@ func (s *Superpose) compileDimensions() error {
 		if err != nil {
 			return err
 		}
+		transformed.Patches = append(transformed.Patches, importPatches...)
 
 		// Patch "<in>" bool vars
 		boolVarPatches, err := s.transformInBoolVars(ctx, pkg)
 		if err != nil {
 			return err
 		}
+		transformed.Patches = append(transformed.Patches, boolVarPatches...)
 
 		// Compile the patches. Even if there aren't any, we need to perform the
 		// compilation.
-		patches := append(boolVarPatches, append(importPatches, userPatches...)...)
-		if err := s.compilePatches(ctx, pkg, patches, dimPkgRefs); err != nil {
-			return fmt.Errorf("compilation of patches to %v in dimension %v failed: %w", s.pkgPath(), dim, err)
+		if err := s.compilePatches(ctx, pkg, transformed, dimPkgRefs); err != nil {
+			return fmt.Errorf("compilation of patches to %v in dimension %v failed: %w", s.pkgPath, dim, err)
 		}
 	}
 	return nil
@@ -116,10 +116,9 @@ func (s *Superpose) compileDimensions() error {
 func (s *Superpose) transformImports(
 	ctx *TransformContext,
 	pkg *packages.Package,
-) ([]*Patch, map[dimPkgRef]struct{}, error) {
-	var patches []*Patch
-	dimPkgRefs := map[dimPkgRef]struct{}{}
+) (patches []*Patch, pkgRefs dimPkgRefs, err error) {
 	// Go over imports, replacing applicable ones w/ their dimension equivalents
+	pkgRefs = dimPkgRefs{}
 	for _, file := range pkg.Syntax {
 		for _, mport := range file.Imports {
 			if pkgPath, err := strconv.Unquote(mport.Path.Value); err != nil {
@@ -142,11 +141,11 @@ func (s *Superpose) transformImports(
 					Range: RangeOf(mport),
 					Str:   fmt.Sprintf("%v %q", alias, s.DimensionPackagePath(pkgPath, ctx.Dimension)),
 				})
-				dimPkgRefs[dimPkgRef{dim: ctx.Dimension, origPkgPath: pkgPath}] = struct{}{}
+				pkgRefs.addRef(pkgPath, ctx.Dimension)
 			}
 		}
 	}
-	return patches, dimPkgRefs, nil
+	return patches, pkgRefs, nil
 }
 
 func (s *Superpose) transformInBoolVars(ctx *TransformContext, pkg *packages.Package) ([]*Patch, error) {
@@ -187,15 +186,15 @@ func (s *Superpose) transformInBoolVars(ctx *TransformContext, pkg *packages.Pac
 func (s *Superpose) compilePatches(
 	ctx *TransformContext,
 	pkg *packages.Package,
-	patches []*Patch,
-	dimPkgRefs map[dimPkgRef]struct{},
+	transformed *TransformResult,
+	dimPkgRefs dimPkgRefs,
 ) error {
 	// Copy the args
 	args := make([]string, len(s.flags.args))
 	copy(args, s.flags.args)
 
 	// Patch files into temp files and update args
-	patchedFileBytes, err := ApplyPatches(pkg.Fset, patches)
+	patchedFileBytes, err := ApplyPatches(pkg.Fset, transformed.Patches)
 	if err != nil {
 		return err
 	}
@@ -204,7 +203,7 @@ func (s *Superpose) compilePatches(
 		return err
 	}
 	for origFile, newBytes := range patchedFileBytes {
-		tmpFile, err := os.CreateTemp(tmpDir, filepath.Base(origFile))
+		tmpFile, err := os.CreateTemp(tmpDir, "*-"+filepath.Base(origFile))
 		if err != nil {
 			return err
 		}
@@ -224,7 +223,7 @@ func (s *Superpose) compilePatches(
 	}
 
 	// Update -p to the dimension package ref
-	args[s.flags.pkgIndex] = s.DimensionPackagePath(s.pkgPath(), ctx.Dimension)
+	args[s.flags.pkgIndex] = s.DimensionPackagePath(s.pkgPath, ctx.Dimension)
 
 	// Update -o to a temp file that we'll put in cache later
 	// TODO(cretz): Update trim path?
@@ -233,22 +232,37 @@ func (s *Superpose) compilePatches(
 	// Create a subkey of the action ID then create a new build ID that is
 	// sub-action ID + "/" + sub-action ID. We use a subkey because the cached
 	// item at the parent key is going to be the package itself after compilation.
-	actionID, err := s.dimensionPackageActionID(s.pkgPath(), ctx.Dimension)
+	actionID, err := s.dimDepPkgActionID(s.pkgPath, ctx.Dimension)
 	if err != nil {
 		return err
 	}
-	compileActionID := cache.Subkey(actionID, "for-compile")
-	actionIDStr := base64.RawURLEncoding.EncodeToString(compileActionID[:])
-	args[s.flags.buildIDIndex] = actionIDStr + "/" + actionIDStr
+	s.hash.Reset()
+	s.hash.Write(actionID)
+	s.hash.Write([]byte("/superpose/for-compile"))
+	compileActionIDStr := base64.RawURLEncoding.EncodeToString(s.hash.Sum(nil)[:len(actionID)])
+	args[s.flags.buildIDIndex] = compileActionIDStr + "/" + compileActionIDStr
 
-	// Update import cfg to reference dimension packages
-	args[s.flags.importCfgIndex], err = s.newTempImportCfg(dimPkgRefs, false)
+	// Update import cfg to replace original packages with their dimension
+	// equivalents
+	importCfg, err := s.loadImportCfg(args[s.flags.importCfgIndex])
 	if err != nil {
-		return err
+		return fmt.Errorf("failed loading import cfg for compile: %w", err)
+	} else if err := importCfg.updateDimPkgRefs(dimPkgRefs, true); err != nil {
+		return fmt.Errorf("failed replacing dim package refs in compile import cfg: %w", err)
+	}
+	// Also include dependent packages
+	for depPkg := range transformed.IncludeDependentPackages {
+		if err := importCfg.includePkg(depPkg); err != nil {
+			return fmt.Errorf("failed including dependent package %v in dimension %v: %w", depPkg, ctx.Dimension, err)
+		}
+	}
+	// Write out import cfg
+	if args[s.flags.importCfgIndex], err = importCfg.writeTempFile(); err != nil {
+		return fmt.Errorf("failed creating compile import cfg: %w", err)
 	}
 
 	// Run compile
-	s.Debugf("Running compile for dimension %v on package %v with args: %v", ctx.Dimension, s.pkgPath(), args)
+	s.Debugf("Running compile for dimension %v on package %v with args: %v", ctx.Dimension, s.pkgPath, args)
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -268,5 +282,5 @@ func (s *Superpose) compilePatches(
 	if err != nil {
 		return err
 	}
-	return cache.PutBytes(actionID, b)
+	return cache.PutBytes(s.buildActionIDToCacheActionID(actionID), b)
 }

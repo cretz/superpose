@@ -14,14 +14,14 @@ import (
 
 type bridgeFile struct {
 	fileName   string
-	dimPkgRefs map[dimPkgRef]struct{}
+	dimPkgRefs dimPkgRefs
 }
 
 // May return nil file which means no dimensions referenced
 func (s *Superpose) buildBridgeFile() (*bridgeFile, error) {
 	// Get dimensions from every file
 	builder := &bridgeFileBuilder{
-		bridgeFile: bridgeFile{dimPkgRefs: map[dimPkgRef]struct{}{}},
+		bridgeFile: bridgeFile{dimPkgRefs: dimPkgRefs{}},
 		imports:    map[string]string{},
 	}
 	for goFile := range s.flags.goFileIndexes {
@@ -61,7 +61,7 @@ func (s *Superpose) buildBridgeFile() (*bridgeFile, error) {
 	}
 	defer f.Close()
 	builder.fileName = f.Name()
-	s.Debugf("Writing the following code to %v:\n%s\n", f.Name(), code)
+	s.Debugf("Writing the following bridge code to %v:\n%s\n", f.Name(), code)
 	if _, err := f.Write([]byte(code)); err != nil {
 		return nil, err
 	}
@@ -146,12 +146,12 @@ func (s *Superpose) buildInitStatements(builder *bridgeFileBuilder, goFile strin
 			// The transformer cannot be ignoring this package
 			applies, err := t.AppliesToPackage(
 				&TransformContext{Context: context.Background(), Superpose: s, Dimension: dim},
-				s.pkgPath(),
+				s.pkgPath,
 			)
 			if err != nil {
 				return false, err
 			} else if !applies {
-				return false, fmt.Errorf("dimension %v referenced in package %v, but it is not applied", dim, s.pkgPath())
+				return false, fmt.Errorf("dimension %v referenced in package %v, but it is not applied", dim, s.pkgPath)
 			}
 
 			// Validate the var decl
@@ -193,8 +193,8 @@ func (s *Superpose) buildInitStatements(builder *bridgeFileBuilder, goFile strin
 
 			// Now confirmed, add init statement
 			s.Debugf("Setting var %v to function reference of %v in dimension %v", spec.Names[0].Name, ref, dim)
-			builder.dimPkgRefs[dimPkgRef{dim: dim, origPkgPath: s.pkgPath()}] = struct{}{}
-			importAlias := builder.importAlias(s.DimensionPackagePath(s.pkgPath(), dim))
+			builder.dimPkgRefs.addRef(s.pkgPath, dim)
+			importAlias := builder.importAlias(s.DimensionPackagePath(s.pkgPath, dim))
 			builder.initStatements = append(builder.initStatements,
 				fmt.Sprintf("%v = %v.%v", spec.Names[0].Name, importAlias, ref))
 			anyStatements = true

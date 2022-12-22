@@ -13,6 +13,15 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+type Transformer interface {
+	// TODO(cretz): Document that if a package is not applied, its dependencies
+	// aren't either
+	AppliesToPackage(ctx *TransformContext, pkgPath string) (bool, error)
+	// TODO(cretz): Document that the pkg should _not_ be mutated and that the
+	// result may be mutated by the system
+	Transform(ctx *TransformContext, pkg *TransformPackage) (*TransformResult, error)
+}
+
 type TransformContext struct {
 	context.Context
 	Superpose *Superpose
@@ -21,6 +30,16 @@ type TransformContext struct {
 
 type TransformPackage struct {
 	*packages.Package
+}
+
+type TransformResult struct {
+	// Cannot contain overlaps and should not replace dimension-applicable import
+	// paths or package name (the internal system does that)
+	Patches []*Patch
+	// Every package path here is added to the import config based on its cached
+	// location in GOCACHE if it's not already in the import config. Therefore it
+	// must already be compiled.
+	IncludeDependentPackages map[string]struct{}
 }
 
 type Range struct{ Pos, End token.Pos }
@@ -57,14 +76,6 @@ type Patch struct {
 func WrapWithPatch(n ast.Node, lhs, rhs string) *Patch {
 	r := RangeOf(n)
 	return &Patch{Range: r, Captures: map[string]Range{"__1__": r}, Str: lhs + "{{.__1__}}" + rhs}
-}
-
-type Transformer interface {
-	// TODO(cretz): Document that if a package is not applied, its dependencies
-	// aren't either
-	AppliesToPackage(ctx *TransformContext, pkgPath string) (bool, error)
-	// TODO(cretz): Document that the pkg should _not_ be mutated
-	Transform(ctx *TransformContext, pkg *TransformPackage) ([]*Patch, error)
 }
 
 // May reorder slice

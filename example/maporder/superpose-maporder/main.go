@@ -46,28 +46,29 @@ func (*transformer) AppliesToPackage(ctx *superpose.TransformContext, pkgPath st
 func (t *transformer) Transform(
 	ctx *superpose.TransformContext,
 	pkg *superpose.TransformPackage,
-) ([]*superpose.Patch, error) {
+) (*superpose.TransformResult, error) {
 	ctx.Superpose.Debugf("Transforming package %v", pkg.PkgPath)
+	res := &superpose.TransformResult{}
 	// Go over each file adding patches if there are any
-	var patches []*superpose.Patch
 	for _, file := range pkg.Syntax {
 		patchedFile := false
 		ast.Inspect(file, func(n ast.Node) bool {
 			if nodePatch := transformNode(pkg, n); nodePatch != nil {
-				patches = append(patches, nodePatch)
+				res.Patches = append(res.Patches, nodePatch)
 				patchedFile = true
 			}
 			return true
 		})
 		if patchedFile {
 			// We add our import at the very top on the same line as package
-			patches = append(patches, &superpose.Patch{
+			res.Patches = append(res.Patches, &superpose.Patch{
 				Range: superpose.Range{Pos: file.Name.End()},
 				Str:   fmt.Sprintf("; import %s %q", mapIterAlias, mapIterPkg),
 			})
+			res.IncludeDependentPackages = map[string]struct{}{mapIterPkg: {}}
 		}
 	}
-	return patches, nil
+	return res, nil
 }
 
 func transformNode(pkg *superpose.TransformPackage, node ast.Node) *superpose.Patch {
