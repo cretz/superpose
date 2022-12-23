@@ -13,72 +13,100 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+// Transformer is the interface all dimension transformers must implement.
 type Transformer interface {
-	// TODO(cretz): Document that if a package is not applied, its dependencies
-	// aren't either. Also that this needs to be cheap, it's called lots.
+	// AppliesToPackage is called each time Superpose needs to know whether this
+	// dimension applies to the given package. This should not be an expensive
+	// call since it is called many times by Superpose.
+	//
+	// When false is returned, `Transform`` will not be called for this package.
 	AppliesToPackage(ctx *TransformContext, pkgPath string) (bool, error)
-	// TODO(cretz): Document that the pkg should _not_ be mutated and that the
-	// result may be mutated by the system
+
+	// Transform returns a [TransformResult] containing patches to the given
+	// package. The `pkg` should never be mutated by this function. The result may
+	// be mutated after this call is returned, so a reference to it should not be
+	// held.
+	//
+	// When error is nil, the result should be non-nil, even if there are no
+	// patches.
 	Transform(ctx *TransformContext, pkg *TransformPackage) (*TransformResult, error)
 }
 
+// TransformContext is a dimension-specific context used for transformer calls.
 type TransformContext struct {
+	// Context is the embedded Go context. This context usually just comes from
+	// [RunMain] and is not closed on completion.
 	context.Context
+
+	// Superpose is the overall [Superpose] instance.
 	Superpose *Superpose
+
+	// Dimension is the current dimension being transformed.
 	Dimension string
 }
 
+// TransformPackage is the package to transform. This currently just embeds
+// [packages.Package] and should never be mutated.
 type TransformPackage struct {
 	*packages.Package
 }
 
+// TransformResult represents a result of a transform.
 type TransformResult struct {
-	// Cannot contain overlaps and should not replace dimension-applicable import
-	// paths or package name (the internal system does that)
+	// Patches contains the set of patches to apply. This cannot overlap and the
+	// patches should not replace dimension-applicable import paths (the internal
+	// system does that).
 	Patches []*Patch
-	// Every package path here is added to the import config based on its cached
-	// location in GOCACHE if it's not already in the import config. Therefore it
-	// must already be compiled.
+
+	// IncludeDependentPackages is a set of packages that should be included on
+	// the transformed code that may not have been included in the original code.
+	// this is important for the Go compiler/linker since they can't otherwise
+	// know ahead of time what the new dependencies are. Since these reference Go
+	// cache during build, these modules should already be built and in the Go
+	// cache.
 	IncludeDependentPackages map[string]struct{}
+
+	// AddLineDirectives, if true, will add a line directive to the top of each
+	// patched Go file informing the Go compiler that the dimension filename is
+	// actually the original filename. This can help with stack traces and
+	// debugging, but transformers should be careful to not alter line numbers
+	// with their patches.
+	AddLineDirectives bool
+
+	// LogPatchedFiles, if true, does a debug log of fully patched file before
+	// writing it. The logs will only be visible when `Verbose` config is true.
+	LogPatchedFiles bool
+
+	// TODO(cretz): Allow customizing of load mode? Per transformer?
+	// LoadMode: packages.LoadMode
 }
 
-type Range struct{ Pos, End token.Pos }
-
-func (r *Range) Overlaps(other *Range) bool {
-	// Check that current pos/end isn't inside the other range or vice versa
-	return r.Contains(other.Pos) ||
-		(other.End > other.Pos && r.Contains(other.End-1)) ||
-		other.Contains(r.Pos) ||
-		(r.End > r.Pos && other.Contains(r.End-1))
-}
-
-func (r *Range) Contains(p token.Pos) bool {
-	// If there's no end, we only need to check if it's exactly the start
-	if !r.End.IsValid() {
-		return p == r.Pos
-	}
-	return r.Pos <= p && r.End > p
-}
-
-func RangeOf(x ast.Node) Range {
-	return Range{Pos: x.Pos(), End: x.End()}
-}
-
+// Patch represents a patch to a file.
 type Patch struct {
-	// 0 End means just insert, no replace
-	Range    Range
+	// Range represents the range to patch. If `End` is 0/unset, this patch is an
+	// insert instead of a replace.
+	Range Range
+
+	// Captures is the set of captures to take from the original file to be used
+	// in an `Str` template (see below).
 	Captures map[string]Range
-	// If there are any "{{", this is a Go template where the map keys are indices
-	// of the Captures and the values the captured strings
+
+	// Str is the string to replace with. If there are any "{{", this is a Go
+	// template where the map keys are indices of the `Captures`` and the values
+	// the captured strings.
 	Str string
 }
 
+// WrapWithPatch creates a patch that adds the lhs and rhs values on either side
+// of the given node.
 func WrapWithPatch(n ast.Node, lhs, rhs string) *Patch {
 	r := RangeOf(n)
 	return &Patch{Range: r, Captures: map[string]Range{"__1__": r}, Str: lhs + "{{.__1__}}" + rhs}
 }
 
-// May reorder slice
+// ApplyPatches applies the given patches to the fileset and returns a map of
+// only affected files and their final contents. Note, this function may reorder
+// the given patches slice.
 func ApplyPatches(fset *token.FileSet, patches []*Patch) (map[string][]byte, error) {
 	// Sort in reverse order
 	sort.Slice(patches, func(i, j int) bool { return patches[i].Range.Pos > patches[j].Range.Pos })
@@ -100,6 +128,8 @@ func ApplyPatches(fset *token.FileSet, patches []*Patch) (map[string][]byte, err
 	return files, nil
 }
 
+// ApplyPatch applies a single patch based on the given fileset, and then sets
+// the resulting content in the files map parameter.
 func ApplyPatch(fset *token.FileSet, patch *Patch, files map[string][]byte) error {
 	// Load file if not already there
 	file := fset.File(patch.Range.Pos)
@@ -146,4 +176,37 @@ func ApplyPatch(fset *token.FileSet, patch *Patch, files map[string][]byte) erro
 	}
 	files[file.Name()] = append(fileBytes[:start], append([]byte(str), fileBytes[end:]...)...)
 	return nil
+}
+
+// Range is a range of positions in Go source.
+type Range struct {
+	// Pos is the inclusive start position. Required.
+	Pos token.Pos
+
+	// End is the exclusive end position. In some uses, `End` can be 0/unset to
+	// mean only a single position based on `Pos`.
+	End token.Pos
+}
+
+// Overlaps returns true if this range overlaps the other range in any way.
+func (r *Range) Overlaps(other *Range) bool {
+	// Check that current pos/end isn't inside the other range or vice versa
+	return r.Contains(other.Pos) ||
+		(other.End > other.Pos && r.Contains(other.End-1)) ||
+		other.Contains(r.Pos) ||
+		(r.End > r.Pos && other.Contains(r.End-1))
+}
+
+// Contains returns true if the given position is in this range.
+func (r *Range) Contains(p token.Pos) bool {
+	// If there's no end, we only need to check if it's exactly the start
+	if !r.End.IsValid() {
+		return p == r.Pos
+	}
+	return r.Pos <= p && r.End > p
+}
+
+// RangeOf gives the range for the given node.
+func RangeOf(x ast.Node) Range {
+	return Range{Pos: x.Pos(), End: x.End()}
 }

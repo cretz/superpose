@@ -14,26 +14,27 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-func (s *Superpose) compileDimensions() error {
+func (s *Superpose) compileDimensions(ctx context.Context) error {
 	// Collect transformers that apply to this package
 	transformers := make(map[string]Transformer, len(s.Config.Transformers))
 	for dim, t := range s.Config.Transformers {
-		ctx := &TransformContext{Context: context.Background(), Superpose: s, Dimension: dim}
+		tctx := &TransformContext{Context: ctx, Superpose: s, Dimension: dim}
 		// Confirm it applies to this package
-		if applies, err := t.AppliesToPackage(ctx, s.pkgPath); err != nil {
+		if applies, err := t.AppliesToPackage(tctx, s.pkgPath); err != nil {
 			return err
 		} else if !applies {
 			continue
 		}
 
-		// Only add the transformer if there is an error getting the cached file
-		// (meaning it is not in cache or other issue)
-		file, fileCheckErr := s.dimDepPkgFile(s.pkgPath, dim)
-		if fileCheckErr != nil {
-			transformers[dim] = t
-		} else {
-			s.Debugf("Skipping compiling %v in dimension %v, already cached at %v", s.pkgPath, dim, file)
+		// Only add the transformer if cache is disabled or there is an error
+		// getting the cached file (meaning it is not in cache or other issue)
+		if !s.Config.ForceTransform {
+			if file, fileCheckErr := s.dimDepPkgFile(s.pkgPath, dim); fileCheckErr == nil {
+				s.Debugf("Skipping compiling %v in dimension %v, already cached at %v", s.pkgPath, dim, file)
+				continue
+			}
 		}
+		transformers[dim] = t
 	}
 
 	// If there are no transformers, nothing to do
@@ -68,6 +69,10 @@ func (s *Superpose) compileDimensions() error {
 				s.Debugf("Failed loading package %v, error #%v: %v", s.pkgPath, i+1, err)
 			}
 			return nil
+		} else if len(maybePkg.CompiledGoFiles) != len(maybePkg.Syntax) {
+			// Sanity check
+			return fmt.Errorf("package %v has %v compiled Go files, but only %v parsed",
+				maybePkg.PkgPath, len(maybePkg.CompiledGoFiles), len(maybePkg.Syntax))
 		}
 		if maybePkg.PkgPath == s.pkgPath {
 			// Sanity check
@@ -84,36 +89,38 @@ func (s *Superpose) compileDimensions() error {
 
 	// Perform transformation and compilation for each dimension
 	for dim, transformer := range s.Config.Transformers {
-		ctx := &TransformContext{Context: context.Background(), Superpose: s, Dimension: dim}
+		tctx := &TransformContext{Context: ctx, Superpose: s, Dimension: dim}
 
 		// Collect user-defined patches
-		transformed, err := transformer.Transform(ctx, &TransformPackage{pkg})
+		transformed, err := transformer.Transform(tctx, &TransformPackage{pkg})
 		if err != nil {
 			return fmt.Errorf("failed transforming %v to dimension %v: %w", s.pkgPath, dim, err)
 		}
 
 		// Patch imports
-		importPatches, dimPkgRefs, err := s.transformImports(ctx, pkg)
+		importPatches, dimPkgRefs, err := s.transformImports(tctx, pkg)
 		if err != nil {
 			return err
 		}
 		transformed.Patches = append(transformed.Patches, importPatches...)
 
 		// Patch "<in>" bool vars
-		boolVarPatches, err := s.transformInBoolVars(ctx, pkg)
+		boolVarPatches, err := s.transformInBoolVars(tctx, pkg)
 		if err != nil {
 			return err
 		}
 		transformed.Patches = append(transformed.Patches, boolVarPatches...)
 
 		// Patch line directives
-		if err := s.addLineDirectives(ctx, pkg, transformed); err != nil {
-			return err
+		if transformed.AddLineDirectives {
+			if err := s.addLineDirectives(tctx, pkg, transformed); err != nil {
+				return err
+			}
 		}
 
 		// Compile the patches. Even if there aren't any, we need to perform the
 		// compilation.
-		if err := s.compilePatches(ctx, pkg, transformed, dimPkgRefs); err != nil {
+		if err := s.compilePatches(tctx, pkg, transformed, dimPkgRefs); err != nil {
 			return fmt.Errorf("compilation of patches to %v in dimension %v failed: %w", s.pkgPath, dim, err)
 		}
 	}
@@ -158,7 +165,7 @@ func (s *Superpose) transformImports(
 func (s *Superpose) transformInBoolVars(ctx *TransformContext, pkg *packages.Package) ([]*Patch, error) {
 	// Go over every var decl looking for a "//dim:<in>" bool var for replacing
 	var patches []*Patch
-	expectedComment := "//" + ctx.Dimension + "<in>"
+	expectedComment := "//" + ctx.Dimension + ":<in>"
 	for _, file := range pkg.Syntax {
 		for _, decl := range file.Decls {
 			// Must be a "var <name> bool //dim:<in>" and nothing else
@@ -195,7 +202,39 @@ func (s *Superpose) addLineDirectives(
 	pkg *packages.Package,
 	transformed *TransformResult,
 ) error {
-	// TODO(cretz): This
+	// Go over each existing patch, and add line directives the first time each
+	// file is seen
+	seenFiles := map[string]bool{}
+	var lineDirectives []*Patch
+	for _, patch := range transformed.Patches {
+		// Get the file for the patch and ensure not already seen
+		fileToken := pkg.Fset.File(patch.Range.Pos)
+		if fileToken == nil {
+			return fmt.Errorf("no file found for patch")
+		} else if seenFiles[fileToken.Name()] {
+			continue
+		}
+		// Find the syntax for the file. We have a sanity check earlier that ensures
+		// CompiledGoFiles and Syntax are the same size
+		var file *ast.File
+		for i, goFile := range pkg.CompiledGoFiles {
+			if goFile == fileToken.Name() {
+				file = pkg.Syntax[i]
+				break
+			}
+		}
+		if file == nil {
+			return fmt.Errorf("cannot find syntax for patched file %v", fileToken.Name())
+		}
+		seenFiles[fileToken.Name()] = true
+
+		// Add the line directive to the end of the package
+		lineDirectives = append(lineDirectives, &Patch{
+			Range: Range{Pos: file.Package},
+			Str:   fmt.Sprintf("/*line %v:%v*/", fileToken.Name(), pkg.Fset.Position(file.Package).Line),
+		})
+	}
+	transformed.Patches = append(transformed.Patches, lineDirectives...)
 	return nil
 }
 
@@ -222,6 +261,9 @@ func (s *Superpose) compilePatches(
 		tmpFile, err := os.CreateTemp(tmpDir, "*-"+filepath.Base(origFile))
 		if err != nil {
 			return err
+		}
+		if transformed.LogPatchedFiles {
+			s.Debugf("In dimension %v, patched %v to:\n%s", ctx.Dimension, origFile, newBytes)
 		}
 		_, err = tmpFile.Write(newBytes)
 		if closeErr := tmpFile.Close(); closeErr != nil && err == nil {

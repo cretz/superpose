@@ -18,14 +18,14 @@ type bridgeFile struct {
 }
 
 // May return nil file which means no dimensions referenced
-func (s *Superpose) buildBridgeFile() (*bridgeFile, error) {
+func (s *Superpose) buildBridgeFile(ctx context.Context) (*bridgeFile, error) {
 	// Get dimensions from every file
 	builder := &bridgeFileBuilder{
 		bridgeFile: bridgeFile{dimPkgRefs: dimPkgRefs{}},
 		imports:    map[string]string{},
 	}
 	for goFile := range s.flags.goFileIndexes {
-		if ok, err := s.buildInitStatements(builder, goFile); err != nil {
+		if ok, err := s.buildInitStatements(ctx, builder, goFile); err != nil {
 			return nil, fmt.Errorf("failed building init statements for file %v: %w", goFile, err)
 		} else if !ok {
 			// Bail because of parsing issues
@@ -77,7 +77,11 @@ type bridgeFileBuilder struct {
 }
 
 // Returns false with no error if we should bail because of parsing issues
-func (s *Superpose) buildInitStatements(builder *bridgeFileBuilder, goFile string) (ok bool, err error) {
+func (s *Superpose) buildInitStatements(
+	ctx context.Context,
+	builder *bridgeFileBuilder,
+	goFile string,
+) (ok bool, err error) {
 	// We load the file ahead of time here since we may manip later
 	b, err := os.ReadFile(goFile)
 	if err != nil {
@@ -145,7 +149,7 @@ func (s *Superpose) buildInitStatements(builder *bridgeFileBuilder, goFile strin
 			}
 			// The transformer cannot be ignoring this package
 			applies, err := t.AppliesToPackage(
-				&TransformContext{Context: context.Background(), Superpose: s, Dimension: dim},
+				&TransformContext{Context: ctx, Superpose: s, Dimension: dim},
 				s.pkgPath,
 			)
 			if err != nil {

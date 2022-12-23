@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/types"
@@ -10,14 +11,19 @@ import (
 
 func main() {
 	superpose.RunMain(
+		context.Background(),
 		superpose.Config{
-			Version: "2",
+			Version: "1",
 			Transformers: map[string]superpose.Transformer{
 				// Transform both of these dimensions
 				"maporder_sorted": &transformer{sorted: true},
 				// "mapsort_insertion": &transformer{sorted: false},
 			},
-			Verbose: true,
+			// Set to true to see compilation details
+			Verbose: false,
+			// We'll disable the cache for demo purposes, but users should usually
+			// never set this
+			ForceTransform: true,
 		},
 		superpose.RunMainConfig{
 			AssumeToolexec: true,
@@ -48,7 +54,10 @@ func (t *transformer) Transform(
 	pkg *superpose.TransformPackage,
 ) (*superpose.TransformResult, error) {
 	ctx.Superpose.Debugf("Transforming package %v", pkg.PkgPath)
-	res := &superpose.TransformResult{}
+	res := &superpose.TransformResult{
+		AddLineDirectives: true,
+		LogPatchedFiles:   ctx.Superpose.Config.Verbose,
+	}
 	// Go over each file adding patches if there are any
 	for _, file := range pkg.Syntax {
 		patchedFile := false

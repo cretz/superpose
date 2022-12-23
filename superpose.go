@@ -19,23 +19,46 @@ import (
 	"github.com/rogpeppe/go-internal/cache"
 )
 
+// Config is configuration for a [Superpose] instance.
 type Config struct {
-	// Required, and must be unique for each transformer change (this affects
-	// cache)
+	// Version is any value that signifies the version of this set of
+	// transformers. This version is used in hashes for caching builds. The
+	// version should be unique per deployed transformer set and updated each time
+	// any change is made. Otherwise a cached build from a previous build may be
+	// used.
+	//
+	// Required.
 	Version string
-	// Keyed by dimension
-	Transformers  map[string]Transformer
-	Verbose       bool
+
+	// Transformers are the set of transformers keyed by dimension name.
+	//
+	// At least one required.
+	Transformers map[string]Transformer
+
+	// Verbose, if true, will log many details during compilation.
+	Verbose bool
+
+	// RetainTempDir, if true, will not delete the temporary directory on
+	// completion. Otherwise, the temporary directory is deleted each run.
 	RetainTempDir bool
-	// By default this is <user-cache>/superpose-build
+
+	// BuildCacheDir is the cache directory to use for caching build output. The
+	// default is [os.UserCacheDir()]/superpose-build.
 	BuildCacheDir string
 
-	// TODO(cretz): Allow customizing of load mode? Per transformer?
-	// LoadMode: packages.LoadMode
+	// ForceTransform, if true, will always transform and compile dimension
+	// packages even if they are already cached. Note, this still uses/updates the
+	// cache, it just doesn't skip if already cached.
+	ForceTransform bool
 }
 
+// Superpose is an instance of the currently running toolexec.
+//
+// No methods on this struct are safe for concurrent use.
 type Superpose struct {
-	Config  Config
+	// Config is the configuration given on start.
+	Config Config
+
 	pkgPath string
 	// Only properly set after we know we're at the compile step
 	flags compileFlags
@@ -48,14 +71,34 @@ type Superpose struct {
 	_tempDir string
 }
 
-func RunMain(config Config, runConfig RunMainConfig) {
+// RunMainConfig is configuration for [RunMain].
+type RunMainConfig struct {
+	// AssumeToolexec, if true, assumes the main run is as `-toolexec`.
+	//
+	// Currently required as true since toolexec form is the only currently
+	// supported form.
+	AssumeToolexec bool
+
+	// AdditionalFlags, if set, are additional flags that can be passed to this
+	// toolexec. They are removed from the upstream arguments.
+	AdditionalFlags *flag.FlagSet
+
+	// AfterFlagParse, if set and `AdditionalFlags` is set, is called once flags
+	// have been parsed.
+	AfterFlagParse func(*Config)
+}
+
+// RunMain runs the configured Superpose tool. This is just [New] +
+// [Superpose.RunMain].
+func RunMain(ctx context.Context, config Config, runConfig RunMainConfig) {
 	if s, err := New(config); err != nil {
 		log.Fatal(err)
-	} else if err = s.RunMain(os.Args[1:], runConfig); err != nil {
+	} else if err = s.RunMain(ctx, os.Args[1:], runConfig); err != nil {
 		log.Fatal(err)
 	}
 }
 
+// New creates a new [Superpose] instance for the given config.
 func New(config Config) (*Superpose, error) {
 	if config.Version == "" {
 		return nil, fmt.Errorf("version required")
@@ -71,13 +114,8 @@ func New(config Config) (*Superpose, error) {
 	}, nil
 }
 
-type RunMainConfig struct {
-	AssumeToolexec  bool
-	AdditionalFlags *flag.FlagSet
-	AfterFlagParse  func(*Config)
-}
-
-func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
+// RunMain runs this Superpose tool for the given args and config.
+func (s *Superpose) RunMain(ctx context.Context, args []string, config RunMainConfig) error {
 	// Cleanup the cache on complete if it's present (meaning it was used)
 	defer func() {
 		if s._buildCache != nil {
@@ -164,12 +202,12 @@ func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 	switch tool {
 	case "compile":
 		var err error
-		if args, err = s.onCompile(args); err != nil {
+		if args, err = s.onCompile(ctx, args); err != nil {
 			return err
 		}
 		s.Debugf("Updated compile args to %v", args)
 	case "link":
-		if err := s.onLink(args); err != nil {
+		if err := s.onLink(ctx, args); err != nil {
 			return err
 		}
 	default:
@@ -183,7 +221,9 @@ func (s *Superpose) RunMain(args []string, config RunMainConfig) error {
 	return cmd.Run()
 }
 
-// Not concurrency safe.
+// UseTempDir returns the temporary directory for use during this process. The
+// temporary directory is usually deleted at the end of the run. The temporary
+// is lazily created when this is first called, hence the error result.
 func (s *Superpose) UseTempDir() (string, error) {
 	if s._tempDir == "" {
 		var err error
@@ -194,31 +234,33 @@ func (s *Superpose) UseTempDir() (string, error) {
 	return s._tempDir, nil
 }
 
+// Debugf logs a debug statement if verbose config is set.
 func (s *Superpose) Debugf(f string, v ...interface{}) {
 	if s.Config.Verbose {
 		log.Printf(f, v...)
 	}
 }
 
+// DimensionPackagePath returns the fully qualified package path for the given
+// package path in the given dimension.
 func (s *Superpose) DimensionPackagePath(origPkg string, dimension string) string {
 	// Just delimit with two underscores for now
 	return origPkg + "__" + dimension
 }
 
-func (s *Superpose) onCompile(args []string) (newArgs []string, err error) {
+func (s *Superpose) onCompile(ctx context.Context, args []string) (newArgs []string, err error) {
 	// Parse flags
 	if err := s.flags.parse(args); err != nil {
 		return nil, err
 	}
 
 	// Compile dimensions
-	if err := s.compileDimensions(); err != nil {
+	if err := s.compileDimensions(ctx); err != nil {
 		return nil, err
 	}
 
-	// Add bridge file to args if any. If no bridge file, just reuse the same
-	// args.
-	bridgeFile, err := s.buildBridgeFile()
+	// Create bridge file if needed. If no bridge file, just reuse the same args.
+	bridgeFile, err := s.buildBridgeFile(ctx)
 	if bridgeFile == nil || err != nil {
 		return args, err
 	}
@@ -244,7 +286,7 @@ func (s *Superpose) onCompile(args []string) (newArgs []string, err error) {
 	return newArgs, nil
 }
 
-func (s *Superpose) onLink(args []string) error {
+func (s *Superpose) onLink(ctx context.Context, args []string) error {
 	// Go over every package file in the import cfg and add entries for every
 	// missing dimension reference.
 
@@ -274,7 +316,7 @@ func (s *Superpose) onLink(args []string) error {
 		for dim, t := range s.Config.Transformers {
 			// Confirm applies
 			applies, err := t.AppliesToPackage(
-				&TransformContext{Context: context.Background(), Superpose: s, Dimension: dim}, origPkgPath)
+				&TransformContext{Context: ctx, Superpose: s, Dimension: dim}, origPkgPath)
 			if err != nil {
 				return fmt.Errorf("failed determining whether package %v applies during link: %w", origPkgPath, err)
 			} else if !applies {
