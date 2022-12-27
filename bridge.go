@@ -180,19 +180,20 @@ func (s *Superpose) buildInitStatements(
 			}
 			if funcDecl == nil {
 				return false, fmt.Errorf("unable to find func decl %v", ref)
+			} else if !funcDecl.Name.IsExported() {
+				return false, fmt.Errorf("referenced dimension bridge function %v is not exported", ref)
 			}
 
 			// Confirm the signatures are identical (param names and everything). Just
 			// do a string print of the types to confirm.
-			emptyFset := token.NewFileSet()
 			var expected, actual strings.Builder
-			if err := printer.Fprint(&expected, emptyFset, funcType); err != nil {
+			if err := printer.Fprint(&expected, fset, funcType); err != nil {
 				return false, err
-			} else if err := printer.Fprint(&actual, emptyFset, funcDecl.Type); err != nil {
+			} else if err := printer.Fprint(&actual, fset, funcDecl.Type); err != nil {
 				return false, err
 			} else if expected.String() != actual.String() {
 				return false, fmt.Errorf("expected var %v to have type %v, instead had %v",
-					spec.Names[0].Name, expected, actual)
+					spec.Names[0].Name, expected.String(), actual.String())
 			}
 
 			// Now confirmed, add init statement

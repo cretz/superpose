@@ -43,7 +43,7 @@ type Config struct {
 	RetainTempDir bool
 
 	// BuildCacheDir is the cache directory to use for caching build output. The
-	// default is [os.UserCacheDir()]/superpose-build.
+	// default is [os.UserCacheDir]()/superpose-build.
 	BuildCacheDir string
 
 	// ForceTransform, if true, will always transform and compile dimension
@@ -59,7 +59,8 @@ type Superpose struct {
 	// Config is the configuration given on start.
 	Config Config
 
-	pkgPath string
+	pkgPath     string
+	origCLIArgs []string
 	// Only properly set after we know we're at the compile step
 	flags compileFlags
 	hash  hash.Hash
@@ -131,6 +132,9 @@ func (s *Superpose) RunMain(ctx context.Context, args []string, config RunMainCo
 			}
 		}
 	}()
+
+	// Set original args
+	s.origCLIArgs = args
 
 	// TODO(cretz): Support more approaches such as wrapping Go build or
 	// go:generate or manual go build
@@ -366,13 +370,17 @@ func (s *Superpose) dimDepPkgActionID(origPkg string, dim string) ([]byte, error
 	if !ok {
 		return nil, fmt.Errorf("unable to find action ID for package %v", origPkg)
 	}
+	return s.dimPkgActionID(pkgActionID, dim), nil
+}
+
+func (s *Superpose) dimPkgActionID(origPkgActionID []byte, dim string) []byte {
 	s.hash.Reset()
-	s.hash.Write(pkgActionID)
+	s.hash.Write(origPkgActionID)
 	s.hash.Write([]byte("/superpose/"))
 	s.hash.Write([]byte(dim))
 	s.hash.Write([]byte("/"))
 	s.hash.Write([]byte(s.Config.Version))
-	return s.hash.Sum(nil)[:len(pkgActionID)], nil
+	return s.hash.Sum(nil)[:len(origPkgActionID)]
 }
 
 // Errors or gives string file, never empty string with no error
@@ -484,8 +492,42 @@ func (s *Superpose) buildCache() (*cache.Cache, error) {
 
 func (s *Superpose) depPkgActionIDs() (map[string][]byte, error) {
 	if s._depPkgActionIDs == nil {
-		// Use "go list" to get action IDs for this package and every dependency
-		cmd := exec.Command("go", "list", "-f", "{{.ImportPath}}|{{.BuildID}}", "-export", "-deps", s.pkgPath)
+		// Use "go list" to get action IDs for this package and every dependency. If
+		// the pkg path is the dummy "command-line-arguments", then we crawl the
+		// importcfg to get the patterns to search.
+		args := []string{"list", "-f", "{{.ImportPath}}|{{.BuildID}}", "-export"}
+		if s.pkgPath != "command-line-arguments" {
+			args = append(args, "-deps", s.pkgPath)
+		} else {
+			// TODO(cretz): Cache since this is reused by link
+			// TODO(cretz): Or better yet, just rework this code
+			var importCfgFile string
+			for i, arg := range s.origCLIArgs {
+				if arg == "-importcfg" {
+					importCfgFile = s.origCLIArgs[i+1]
+					break
+				}
+			}
+			if importCfgFile == "" {
+				return nil, fmt.Errorf("no import cfg file for link")
+			}
+			importCfg, err := s.loadImportCfg(importCfgFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed loading link import cfg: %w", err)
+			}
+			for _, line := range importCfg.lines {
+				if !strings.HasPrefix(line, "packagefile ") {
+					continue
+				}
+				pkgPath := strings.TrimPrefix(line[:strings.Index(line, "=")], "packagefile ")
+				if pkgPath != "command-line-arguments" {
+					args = append(args, pkgPath)
+				}
+			}
+		}
+
+		s.Debugf("Getting dependent package action IDs via go command with args %v", args)
+		cmd := exec.Command("go", args...)
 		b, err := cmd.CombinedOutput()
 		if err != nil {
 			return nil, fmt.Errorf("failed listing packages: %w. Output: %s", err, b)

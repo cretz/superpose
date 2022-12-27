@@ -5,7 +5,11 @@
 Superpose is a library for creating Go compiler wrappers/plugins that support transforming packages in other
 "dimensions" and making them callable from the original package.
 
-See [the map order example](example/maporder) to show how you can have deterministically ordered map ranges.
+Examples:
+
+* [example/logger](example/logger) - Shows replacing standard library code by replacing "Hello" with "Aloha" in all logs
+  when running under the other dimension
+* [example/maporder](example/maporder) - More advanced example showing how to have deterministic map iteration
 
 ## Usage
 
@@ -16,6 +20,7 @@ TODO(cretz): Explain
 * Usage inside toolexec
 * Advanced options (additional deps, cache, line directives, additional flags, etc)
 * Testing
+* Concepts/definitions
 
 ## How it Works
 

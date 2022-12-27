@@ -10,6 +10,6 @@ To compile, first the compiler tool must be compiled. From the root of the repo,
 
 Now it can be executed as toolexec, for example:
 
-    go run ./example/maporder -toolexec /path/to/superpose-maporder
+    go run -toolexec /path/to/superpose-maporder ./example/maporder
 
 Note how the output of the second map print is deterministically sorted each time.
