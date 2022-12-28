@@ -8,8 +8,9 @@ Superpose is a library for creating Go compiler wrappers/plugins that support tr
 Examples:
 
 * [example/logger](example/logger) - Shows replacing standard library code by replacing "Hello" with "Aloha" in all logs
-  when running under the other dimension
+  when running under the other dimension. Also shows a test case.
 * [example/maporder](example/maporder) - More advanced example showing how to have deterministic map iteration
+* [example/mocktime](example/mocktime) - Shows a basic way to replace `time.Now()` for a mock clock
 
 ## Usage
 

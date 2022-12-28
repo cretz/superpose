@@ -13,7 +13,7 @@ func main() {
 	superpose.RunMain(
 		context.Background(),
 		superpose.Config{
-			Version: "1",
+			Version: superpose.MustLoadCurrentExeContentID(),
 			Transformers: map[string]superpose.Transformer{
 				// Transform both of these dimensions
 				"maporder_sorted": &transformer{sorted: true},
@@ -21,9 +21,6 @@ func main() {
 			},
 			// Set to true to see compilation details
 			Verbose: false,
-			// We'll disable the cache for demo purposes, but users should usually
-			// never set this
-			ForceTransform: true,
 		},
 		superpose.RunMainConfig{
 			AssumeToolexec: true,
