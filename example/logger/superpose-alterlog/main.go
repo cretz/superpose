@@ -15,13 +15,10 @@ func main() {
 	superpose.RunMain(
 		context.Background(),
 		superpose.Config{
-			Version:      "2",
+			Version:      superpose.MustLoadCurrentExeContentID(),
 			Transformers: map[string]superpose.Transformer{"alterlog": transformer{}},
 			// Set to true to see compilation details
 			Verbose: false,
-			// We'll disable the cache for demo purposes, but users should usually
-			// never set this
-			ForceTransform: true,
 		},
 		superpose.RunMainConfig{
 			AssumeToolexec: true,

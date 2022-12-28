@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/rogpeppe/go-internal/cache"
 )
@@ -26,6 +27,10 @@ type Config struct {
 	// version should be unique per deployed transformer set and updated each time
 	// any change is made. Otherwise a cached build from a previous build may be
 	// used.
+	//
+	// While it is a minor performance hit, often developers use
+	// [MustLoadCurrentExeContentID] as the version to ensure each executable is
+	// uniquely versioned.
 	//
 	// Required.
 	Version string
@@ -607,7 +612,7 @@ func (s *Superpose) toolexecVersionFull(tool string, args []string) error {
 	}
 
 	// Get this exe's content ID
-	exeContentID, err := fetchExeContentID()
+	exeContentID, err := LoadCurrentExeContentID()
 	if err != nil {
 		return err
 	}
@@ -618,7 +623,7 @@ func (s *Superpose) toolexecVersionFull(tool string, args []string) error {
 	s.hash.Reset()
 	s.hash.Write(goToolID)
 	s.hash.Write([]byte("/superpose/"))
-	s.hash.Write(exeContentID)
+	s.hash.Write([]byte(exeContentID))
 	s.hash.Write([]byte("/"))
 	s.hash.Write([]byte(s.Config.Version))
 	// Go only allows a certain size
@@ -706,29 +711,43 @@ func loadGoToolID(tool string, args []string) (line string, b []byte, err error)
 	return
 }
 
-var exeContentID []byte
+var exeContentID string
+var exeContentIDErr error
+var exeContentIDOnce sync.Once
 
-func fetchExeContentID() ([]byte, error) {
-	if len(exeContentID) == 0 {
-		// Most of this taken from Garble
-		exePath, err := os.Executable()
-		if err != nil {
-			return nil, err
-		}
-		cmd := exec.Command("go", "tool", "buildid", exePath)
-		out, err := cmd.Output()
-		if err != nil {
-			if err, _ := err.(*exec.ExitError); err != nil {
-				return nil, fmt.Errorf("%v: %s", err, err.Stderr)
-			}
-			return nil, err
-		}
-		buildID := string(out)
-		contentID := buildID[strings.LastIndex(buildID, "/")+1:]
-		exeContentID, err = base64.RawURLEncoding.DecodeString(contentID)
-		if err != nil {
-			return nil, err
-		}
+// MustLoadCurrentExeContentID is [LoadCurrentExeContentID] that panics instead
+// of returns an error.
+func MustLoadCurrentExeContentID() string {
+	ret, err := LoadCurrentExeContentID()
+	if err != nil {
+		panic(err)
 	}
-	return exeContentID, nil
+	return ret
+}
+
+// LoadCurrentExeContentID loads the last section of the current executable's
+// build ID using "go tool buildid". The result is a base 64'd "content ID"
+// which is unique per executable output. This call is memoized for fast
+// re-execution.
+func LoadCurrentExeContentID() (string, error) {
+	exeContentIDOnce.Do(func() { exeContentID, exeContentIDErr = loadCurrentExeContentID() })
+	return exeContentID, exeContentIDErr
+}
+
+func loadCurrentExeContentID() (string, error) {
+	// Some of this taken from Garble
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.Command("go", "tool", "buildid", exePath)
+	out, err := cmd.Output()
+	if err != nil {
+		if err, _ := err.(*exec.ExitError); err != nil {
+			return "", fmt.Errorf("%v: %s", err, err.Stderr)
+		}
+		return "", err
+	}
+	buildID := string(out)
+	return buildID[strings.LastIndex(buildID, "/")+1:], nil
 }
