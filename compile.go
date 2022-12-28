@@ -42,7 +42,7 @@ func (s *Superpose) compileDimensions(ctx context.Context) error {
 		return nil
 	}
 
-	// Load the package
+	// Load the packages
 	packagesLogf := s.Debugf
 	if !s.Config.Verbose {
 		packagesLogf = nil
@@ -53,74 +53,86 @@ func (s *Superpose) compileDimensions(ctx context.Context) error {
 				packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes |
 				packages.NeedSyntax | packages.NeedTypesInfo,
 			Logf:  packagesLogf,
-			Tests: true,
+			Tests: s.pkgForTest,
 		},
 		s.pkgPath,
 	)
 	if err != nil || len(pkgs) == 0 {
 		return err
 	}
-	var pkg *packages.Package
-	for _, maybePkg := range pkgs {
+
+	// Retain only the packages that match our expected path, doing sanity checks
+	// along the way
+	n := 0
+	for _, pkg := range pkgs {
 		// We'll debug-print any errors encountered, but we won't fail the build,
 		// we'll let the downstream Go compiler give those errors
-		if len(maybePkg.Errors) > 0 {
-			for i, err := range maybePkg.Errors {
+		if len(pkg.Errors) > 0 {
+			for i, err := range pkg.Errors {
 				s.Debugf("Failed loading package %v, error #%v: %v", s.pkgPath, i+1, err)
 			}
 			return nil
-		} else if len(maybePkg.CompiledGoFiles) != len(maybePkg.Syntax) {
-			// Sanity check
+		} else if len(pkg.CompiledGoFiles) != len(pkg.Syntax) {
+			// Sanity check to confirm files are same as compiled set
 			return fmt.Errorf("package %v has %v compiled Go files, but only %v parsed",
-				maybePkg.PkgPath, len(maybePkg.CompiledGoFiles), len(maybePkg.Syntax))
+				pkg.PkgPath, len(pkg.CompiledGoFiles), len(pkg.Syntax))
+		} else if pkg.Fset != pkgs[0].Fset {
+			// Sanity check to confirm the same fileset is used across all
+			return fmt.Errorf("fileset pointers differ across packages unexpectedly")
 		}
-		if maybePkg.PkgPath == s.pkgPath {
-			// Sanity check
-			if pkg != nil {
-				return fmt.Errorf("package %v found twice", s.pkgPath)
-			}
-			pkg = maybePkg
-			break
+
+		// Keep all that match the path. This can be multiple in same-package test
+		// case situations.
+		if pkg.PkgPath == s.pkgPath {
+			pkgs[n] = pkg
+			n++
 		}
 	}
-	if pkg == nil {
-		return fmt.Errorf("package %v not found amongst %v loaded", s.pkgPath, len(pkgs))
+	pkgs = pkgs[:n]
+	if len(pkgs) == 0 {
+		return fmt.Errorf("package %v not found", s.pkgPath)
 	}
 
 	// Perform transformation and compilation for each dimension
 	for dim, transformer := range s.Config.Transformers {
 		tctx := &TransformContext{Context: ctx, Superpose: s, Dimension: dim}
 
-		// Collect user-defined patches
-		transformed, err := transformer.Transform(tctx, &TransformPackage{pkg})
-		if err != nil {
-			return fmt.Errorf("failed transforming %v to dimension %v: %w", s.pkgPath, dim, err)
-		}
+		// 1:1 with packages
+		results := make([]*TransformResult, len(pkgs))
+		resultDimPkgRefs := dimPkgRefs{}
+		for i, pkg := range pkgs {
+			// Collect user-defined patches
+			results[i], err = transformer.Transform(tctx, &TransformPackage{pkg})
+			if err != nil {
+				return fmt.Errorf("failed transforming %v to dimension %v: %w", s.pkgPath, dim, err)
+			}
 
-		// Patch imports
-		importPatches, dimPkgRefs, err := s.transformImports(tctx, pkg)
-		if err != nil {
-			return err
-		}
-		transformed.Patches = append(transformed.Patches, importPatches...)
-
-		// Patch "<in>" bool vars
-		boolVarPatches, err := s.transformInBoolVars(tctx, pkg)
-		if err != nil {
-			return err
-		}
-		transformed.Patches = append(transformed.Patches, boolVarPatches...)
-
-		// Patch line directives
-		if transformed.AddLineDirectives {
-			if err := s.addLineDirectives(tctx, pkg, transformed); err != nil {
+			// Patch imports
+			importPatches, dimPkgRefs, err := s.transformImports(tctx, pkg)
+			if err != nil {
 				return err
+			}
+			results[i].Patches = append(results[i].Patches, importPatches...)
+			resultDimPkgRefs.addAll(dimPkgRefs)
+
+			// Patch "<in>" bool vars
+			boolVarPatches, err := s.transformInBoolVars(tctx, pkg)
+			if err != nil {
+				return err
+			}
+			results[i].Patches = append(results[i].Patches, boolVarPatches...)
+
+			// Patch line directives
+			if results[i].AddLineDirectives {
+				if err := s.addLineDirectives(tctx, pkg, results[i]); err != nil {
+					return err
+				}
 			}
 		}
 
 		// Compile the patches. Even if there aren't any, we need to perform the
 		// compilation.
-		if err := s.compilePatches(tctx, pkg, transformed, dimPkgRefs); err != nil {
+		if err := s.compilePatches(tctx, pkgs, results, resultDimPkgRefs); err != nil {
 			return fmt.Errorf("compilation of patches to %v in dimension %v failed: %w", s.pkgPath, dim, err)
 		}
 	}
@@ -240,8 +252,8 @@ func (s *Superpose) addLineDirectives(
 
 func (s *Superpose) compilePatches(
 	ctx *TransformContext,
-	pkg *packages.Package,
-	transformed *TransformResult,
+	pkgs []*packages.Package,
+	transformed []*TransformResult,
 	dimPkgRefs dimPkgRefs,
 ) error {
 	// Copy the args
@@ -249,35 +261,37 @@ func (s *Superpose) compilePatches(
 	copy(args, s.flags.args)
 
 	// Patch files into temp files and update args
-	patchedFileBytes, err := ApplyPatches(pkg.Fset, transformed.Patches)
-	if err != nil {
-		return err
-	}
 	tmpDir, err := s.UseTempDir()
 	if err != nil {
 		return err
 	}
-	for origFile, newBytes := range patchedFileBytes {
-		tmpFile, err := os.CreateTemp(tmpDir, "*-"+filepath.Base(origFile))
+	for i, pkg := range pkgs {
+		patchedFileBytes, err := ApplyPatches(pkg.Fset, transformed[i].Patches)
 		if err != nil {
 			return err
 		}
-		if transformed.LogPatchedFiles {
-			s.Debugf("In dimension %v, patched %v to:\n%s", ctx.Dimension, origFile, newBytes)
+		for origFile, newBytes := range patchedFileBytes {
+			tmpFile, err := os.CreateTemp(tmpDir, "*-"+filepath.Base(origFile))
+			if err != nil {
+				return err
+			}
+			if transformed[i].LogPatchedFiles {
+				s.Debugf("In dimension %v, patched %v to:\n%s", ctx.Dimension, origFile, newBytes)
+			}
+			_, err = tmpFile.Write(newBytes)
+			if closeErr := tmpFile.Close(); closeErr != nil && err == nil {
+				err = closeErr
+			}
+			if err != nil {
+				return err
+			}
+			// Update arg
+			fileIndex, ok := s.flags.goFileIndexes[origFile]
+			if !ok {
+				return fmt.Errorf("cannot find expected file %v in compile args", origFile)
+			}
+			args[fileIndex] = tmpFile.Name()
 		}
-		_, err = tmpFile.Write(newBytes)
-		if closeErr := tmpFile.Close(); closeErr != nil && err == nil {
-			err = closeErr
-		}
-		if err != nil {
-			return err
-		}
-		// Update arg
-		fileIndex, ok := s.flags.goFileIndexes[origFile]
-		if !ok {
-			return fmt.Errorf("cannot find expected file %v in compile args", origFile)
-		}
-		args[fileIndex] = tmpFile.Name()
 	}
 
 	// Update -p to the dimension package ref
@@ -309,9 +323,20 @@ func (s *Superpose) compilePatches(
 		return fmt.Errorf("failed replacing dim package refs in compile import cfg: %w", err)
 	}
 	// Also include dependent packages
-	for depPkg := range transformed.IncludeDependentPackages {
-		if err := importCfg.includePkg(depPkg); err != nil {
-			return fmt.Errorf("failed including dependent package %v in dimension %v: %w", depPkg, ctx.Dimension, err)
+	seenDependentPackages := map[string]bool{}
+	var metadata dimPkgMetadata
+	for _, transformedRes := range transformed {
+		for depPkg := range transformedRes.IncludeDependentPackages {
+			if seenDependentPackages[depPkg] {
+				continue
+			}
+			seenDependentPackages[depPkg] = true
+			// Include in import config
+			if err := importCfg.includePkg(depPkg); err != nil {
+				return fmt.Errorf("failed including dependent package %v in dimension %v: %w", depPkg, ctx.Dimension, err)
+			}
+			// Include in metadata
+			metadata.IncludeDependentPackages = append(metadata.IncludeDependentPackages, depPkg)
 		}
 	}
 	// Write out import cfg
@@ -345,9 +370,5 @@ func (s *Superpose) compilePatches(
 	}
 
 	// Also put metadata in cache
-	metadata := &dimPkgMetadata{IncludeDependentPackages: make([]string, 0, len(transformed.IncludeDependentPackages))}
-	for depPkg := range transformed.IncludeDependentPackages {
-		metadata.IncludeDependentPackages = append(metadata.IncludeDependentPackages, depPkg)
-	}
-	return s.setDimPkgMetadata(actionID, metadata)
+	return s.setDimPkgMetadata(actionID, &metadata)
 }

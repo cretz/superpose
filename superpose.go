@@ -60,7 +60,9 @@ type Superpose struct {
 	Config Config
 
 	pkgPath     string
+	pkgForTest  bool
 	origCLIArgs []string
+	tool        string
 	// Only properly set after we know we're at the compile step
 	flags compileFlags
 	hash  hash.Hash
@@ -108,11 +110,22 @@ func New(config Config) (*Superpose, error) {
 	} else if sha256.Size != cache.HashSize {
 		return nil, fmt.Errorf("cache library no longer uses expected hash size")
 	}
-	return &Superpose{
+	s := &Superpose{
 		Config:  config,
 		pkgPath: os.Getenv("TOOLEXEC_IMPORTPATH"),
 		hash:    sha256.New(),
-	}, nil
+	}
+	// The import path may be "foo [foo.test]" for tests, so we check that here.
+	// We have confirmed with Go impl that import paths cannot contain spaces.
+	spaceIndex := strings.Index(s.pkgPath, " ")
+	if spaceIndex > 0 {
+		if !strings.HasSuffix(s.pkgPath, ".test]") {
+			return nil, fmt.Errorf("assuming test because space in package path, but got %v", s.pkgPath)
+		}
+		s.pkgPath = s.pkgPath[:spaceIndex]
+		s.pkgForTest = true
+	}
+	return s, nil
 }
 
 // RunMain runs this Superpose tool for the given args and config.
@@ -187,14 +200,14 @@ func (s *Superpose) RunMain(ctx context.Context, args []string, config RunMainCo
 
 	// Get import path and tool exe
 	args = args[toolArgIndex:]
-	_, tool := filepath.Split(args[0])
+	_, s.tool = filepath.Split(args[0])
 	if runtime.GOOS == "windows" {
-		tool = strings.TrimSuffix(tool, ".exe")
+		s.tool = strings.TrimSuffix(s.tool, ".exe")
 	}
 
 	// Go uses -V=full at first, so handle just that
 	if len(args) == 2 && args[1] == "-V=full" {
-		return s.toolexecVersionFull(tool, args)
+		return s.toolexecVersionFull(s.tool, args)
 	}
 
 	// Henceforth, we expect a package
@@ -202,8 +215,8 @@ func (s *Superpose) RunMain(ctx context.Context, args []string, config RunMainCo
 		return fmt.Errorf("no TOOLEXEC_IMPORTPATH env var")
 	}
 
-	s.Debugf("Intercepting toolexec with args: %v", args)
-	switch tool {
+	s.Debugf("Intercepting toolexec with import path %q and args: %v", os.Getenv("TOOLEXEC_IMPORTPATH"), args)
+	switch s.tool {
 	case "compile":
 		var err error
 		if args, err = s.onCompile(ctx, args); err != nil {
@@ -215,7 +228,7 @@ func (s *Superpose) RunMain(ctx context.Context, args []string, config RunMainCo
 			return err
 		}
 	default:
-		s.Debugf("No interception needed for tool %v", tool)
+		s.Debugf("No interception needed for tool %v", s.tool)
 	}
 
 	// Run the command
@@ -317,6 +330,11 @@ func (s *Superpose) onLink(ctx context.Context, args []string) error {
 			continue
 		}
 		origPkgPath := strings.TrimPrefix(line[:strings.Index(line, "=")], "packagefile ")
+		// Do not include the ".test" special package
+		// TODO(cretz): What if there's a legit ".test" package?
+		if strings.HasSuffix(origPkgPath, ".test") {
+			continue
+		}
 		for dim, t := range s.Config.Transformers {
 			// Confirm applies
 			applies, err := t.AppliesToPackage(
@@ -492,13 +510,25 @@ func (s *Superpose) buildCache() (*cache.Cache, error) {
 
 func (s *Superpose) depPkgActionIDs() (map[string][]byte, error) {
 	if s._depPkgActionIDs == nil {
-		// Use "go list" to get action IDs for this package and every dependency. If
-		// the pkg path is the dummy "command-line-arguments", then we crawl the
-		// importcfg to get the patterns to search.
+		// Use "go list" to get action IDs for this package and every dependency.
+		// During compile, pkgPath is a legit package path, but during link
+		// sometimes it is not (sometimes it "command-line-arguments" or the test
+		// package). So during link we use importcfg to know dependents.
+		// TODO(cretz): Why not change to always using importcfg?
 		args := []string{"list", "-f", "{{.ImportPath}}|{{.BuildID}}", "-export"}
 		if s.pkgPath != "command-line-arguments" {
-			args = append(args, "-deps", s.pkgPath)
+			pkgPath, forTest := s.pkgPath, s.pkgForTest
+			if strings.HasSuffix(pkgPath, ".test") {
+				pkgPath, forTest = strings.TrimSuffix(pkgPath, ".test"), true
+			}
+			if forTest {
+				args = append(args, "-test")
+			}
+			args = append(args, "-deps", pkgPath)
 		} else {
+			// We want to ignore missing packages here since link has some
+			// dependencies that are not real packages
+			args = append(args, "-e")
 			// TODO(cretz): Cache since this is reused by link
 			// TODO(cretz): Or better yet, just rework this code
 			var importCfgFile string
@@ -520,9 +550,7 @@ func (s *Superpose) depPkgActionIDs() (map[string][]byte, error) {
 					continue
 				}
 				pkgPath := strings.TrimPrefix(line[:strings.Index(line, "=")], "packagefile ")
-				if pkgPath != "command-line-arguments" {
-					args = append(args, pkgPath)
-				}
+				args = append(args, pkgPath)
 			}
 		}
 
@@ -550,7 +578,17 @@ func (s *Superpose) depPkgActionIDs() (map[string][]byte, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid action ID: %w, list line: %v", err, line)
 			}
-			pkgActionIDs[line[:lastPipe]] = pkgActionID
+			pkgPath := line[:lastPipe]
+			// The pkg path may be in the form of "foo [foo.test]", so we must remove
+			// the bracketed part
+			spaceIndex := strings.Index(pkgPath, " ")
+			if spaceIndex > 0 {
+				if !strings.HasSuffix(pkgPath, ".test]") {
+					return nil, fmt.Errorf("assuming test because space in package path, but got %v", pkgPath)
+				}
+				pkgPath = pkgPath[:spaceIndex]
+			}
+			pkgActionIDs[pkgPath] = pkgActionID
 		}
 		s._depPkgActionIDs = pkgActionIDs
 	}

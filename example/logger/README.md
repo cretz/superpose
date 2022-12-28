@@ -14,3 +14,7 @@ Now it can be executed as toolexec, for example:
     go run -toolexec /path/to/superpose-alterlog ./example/logger
 
 Note how the output of the first print is "Hello, World!" but the second is "Aloha, World!".
+
+It can also be tested using that same tool:
+
+    go test -toolexec /path/to/superpose-alterlog ./example/logger/superpose-alterlog

@@ -116,3 +116,11 @@ func (d dimPkgRefs) addRef(origPkgPath string, dim string) {
 	}
 	pkgMap[origPkgPath] = struct{}{}
 }
+
+func (d dimPkgRefs) addAll(other dimPkgRefs) {
+	for dim, origPkgPaths := range other {
+		for origPkgPath := range origPkgPaths {
+			d.addRef(origPkgPath, dim)
+		}
+	}
+}

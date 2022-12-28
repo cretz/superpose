@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"strings"
 
 	"github.com/cretz/superpose"
 )
@@ -14,7 +15,7 @@ func main() {
 	superpose.RunMain(
 		context.Background(),
 		superpose.Config{
-			Version:      "1",
+			Version:      "2",
 			Transformers: map[string]superpose.Transformer{"alterlog": transformer{}},
 			// Set to true to see compilation details
 			Verbose: false,
@@ -33,7 +34,7 @@ type transformer struct{}
 func (transformer) AppliesToPackage(ctx *superpose.TransformContext, pkgPath string) (bool, error) {
 	// Our dimension applies to the standard logging package and our sample
 	// package
-	return pkgPath == "log" || pkgPath == "github.com/cretz/superpose/example/logger", nil
+	return pkgPath == "log" || strings.HasPrefix(pkgPath, "github.com/cretz/superpose/example/logger"), nil
 }
 
 func (transformer) Transform(

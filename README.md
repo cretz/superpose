@@ -52,13 +52,13 @@ TODO(cretz):
 ## TODO
 
 * More docs
-* Test framework
 * Tests, including:
   * An import whose package name is not related to its path
   * Relative/local imports
   * Explicit import aliases
   * Different build tags
-  * Test files/packages
+  * Transforming test files/packages
+  * Test for transformer inside _test package
   * go:embed
   * Build caching
   * Build "-a" to invalidate cache
