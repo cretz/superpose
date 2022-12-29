@@ -47,13 +47,18 @@ func (s *Superpose) compileDimensions(ctx context.Context) error {
 	if !s.Config.Verbose {
 		packagesLogf = nil
 	}
+	var buildFlags []string
+	if s.buildTags != "" {
+		buildFlags = append(buildFlags, "-tags", s.buildTags)
+	}
 	pkgs, err := packages.Load(
 		&packages.Config{
 			Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 				packages.NeedImports | packages.NeedTypes | packages.NeedTypesSizes |
 				packages.NeedSyntax | packages.NeedTypesInfo,
-			Logf:  packagesLogf,
-			Tests: s.pkgForTest,
+			Logf:       packagesLogf,
+			Tests:      s.pkgForTest,
+			BuildFlags: buildFlags,
 		},
 		s.pkgPath,
 	)

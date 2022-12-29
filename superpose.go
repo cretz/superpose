@@ -64,6 +64,7 @@ type Superpose struct {
 	// Config is the configuration given on start.
 	Config Config
 
+	buildTags   string
 	pkgPath     string
 	pkgForTest  bool
 	origCLIArgs []string
@@ -88,12 +89,13 @@ type RunMainConfig struct {
 	AssumeToolexec bool
 
 	// AdditionalFlags, if set, are additional flags that can be passed to this
-	// toolexec. They are removed from the upstream arguments.
+	// toolexec. They are removed from the upstream arguments. This flag set is
+	// mutated internally to add superpose-specific flags.
 	AdditionalFlags *flag.FlagSet
 
-	// AfterFlagParse, if set and `AdditionalFlags` is set, is called once flags
-	// have been parsed.
-	AfterFlagParse func(*Config)
+	// AfterFlagParse, if set, called once toolexec flags have been parsed. This
+	// can mutate the given config.
+	AfterFlagParse func(*Config) error
 }
 
 // RunMain runs the configured Superpose tool. This is just [New] +
@@ -160,51 +162,13 @@ func (s *Superpose) RunMain(ctx context.Context, args []string, config RunMainCo
 		return fmt.Errorf("only assume toolexec currently supported")
 	}
 
-	// If the first arg is --verbose, set as verbose and remove the arg
-	if args[0] == "--verbose" {
-		s.Config.Verbose = true
-		args = args[1:]
-	}
-
-	// Find index of first non-additional arg
-	toolArgIndex := 0
-	if config.AdditionalFlags != nil {
-		for ; toolArgIndex < len(args); toolArgIndex++ {
-			flagStr := args[toolArgIndex]
-			if !strings.HasPrefix(flagStr, "-") {
-				break
-			}
-			flagStr = strings.TrimLeft(flagStr, "-")
-			eqIndex := strings.Index(flagStr, "=")
-			if eqIndex >= 0 {
-				flagStr = flagStr[:eqIndex]
-			}
-			// Make sure the flag exists and if not bool, skip arg if not set w/ "="
-			flag := config.AdditionalFlags.Lookup(flagStr)
-			if flag == nil {
-				return fmt.Errorf("unrecognized flag %v", flagStr)
-			}
-			isBoolIface, _ := flag.Value.(interface{ IsBoolFlag() bool })
-			if eqIndex == -1 && (isBoolIface == nil || !isBoolIface.IsBoolFlag()) {
-				// Skip arg
-				toolArgIndex++
-			}
-		}
-	}
-
-	// Confirm tool there and parse additional flags before checking tool
-	if toolArgIndex >= len(args) {
-		return fmt.Errorf("no tool name found")
-	} else if config.AdditionalFlags != nil {
-		if err := config.AdditionalFlags.Parse(args[:toolArgIndex]); err != nil {
-			return err
-		} else if config.AfterFlagParse != nil {
-			config.AfterFlagParse(&s.Config)
-		}
+	// Parse pre-tool args
+	var err error
+	if args, err = s.parseToolexecArgs(config, args); err != nil {
+		return err
 	}
 
 	// Get import path and tool exe
-	args = args[toolArgIndex:]
 	_, s.tool = filepath.Split(args[0])
 	if runtime.GOOS == "windows" {
 		s.tool = strings.TrimSuffix(s.tool, ".exe")
@@ -268,6 +232,68 @@ func (s *Superpose) Debugf(f string, v ...interface{}) {
 func (s *Superpose) DimensionPackagePath(origPkg string, dimension string) string {
 	// Just delimit with two underscores for now
 	return origPkg + "__" + dimension
+}
+
+func (s *Superpose) parseToolexecArgs(runConfig RunMainConfig, args []string) (toolArgs []string, err error) {
+	// If there is not a flag set, create one
+	flags := runConfig.AdditionalFlags
+	if flags == nil {
+		flags = flag.NewFlagSet("superpose-toolexec", flag.ContinueOnError)
+	} else if flags.Lookup("verbose") != nil {
+		return nil, fmt.Errorf("verbose flag reserved for internal use")
+	} else if flags.Lookup("buildtags") != nil {
+		return nil, fmt.Errorf("buildtags flag reserved for internal use")
+	}
+
+	// Accept `-verbose` and `-buildtags`
+	var verbose bool
+	flags.BoolVar(&verbose, "verbose", false, "verbose toolexec output")
+	flags.StringVar(&s.buildTags, "buildtags", "", "build tags")
+
+	// Find first arg that is not one of our toolexec flags
+	toolArgIndex := 0
+	for ; toolArgIndex < len(args); toolArgIndex++ {
+		flagStr := args[toolArgIndex]
+		if !strings.HasPrefix(flagStr, "-") {
+			break
+		}
+		flagStr = strings.TrimLeft(flagStr, "-")
+		eqIndex := strings.Index(flagStr, "=")
+		if eqIndex >= 0 {
+			flagStr = flagStr[:eqIndex]
+		}
+		// Make sure the flag exists and if not bool, skip arg if not set w/ "="
+		flag := flags.Lookup(flagStr)
+		if flag == nil {
+			return nil, fmt.Errorf("unrecognized flag %v", flagStr)
+		}
+		isBoolIface, _ := flag.Value.(interface{ IsBoolFlag() bool })
+		if eqIndex == -1 && (isBoolIface == nil || !isBoolIface.IsBoolFlag()) {
+			// Skip arg
+			toolArgIndex++
+		}
+	}
+	if toolArgIndex >= len(args) {
+		return nil, fmt.Errorf("no tool name found")
+	}
+
+	// Parse the flags
+	if err := flags.Parse(args[:toolArgIndex]); err != nil {
+		return nil, fmt.Errorf("failed parsing pre-tool toolexec flags: %w", err)
+	}
+
+	// Set internal flags
+	if verbose {
+		s.Config.Verbose = true
+	}
+
+	// Run post-processor if present
+	if runConfig.AfterFlagParse != nil {
+		if err := runConfig.AfterFlagParse(&s.Config); err != nil {
+			return nil, err
+		}
+	}
+	return args[toolArgIndex:], nil
 }
 
 func (s *Superpose) onCompile(ctx context.Context, args []string) (newArgs []string, err error) {
@@ -427,7 +453,12 @@ func (s *Superpose) dimDepPkgFile(origPkg string, dim string) (string, error) {
 
 // Errors or gives string file, never empty string with no error
 func (s *Superpose) pkgFile(pkgPath string) (string, error) {
-	cmd := exec.Command("go", "list", "-f", "{{.Export}}", "-export", pkgPath)
+	args := []string{"list", "-f", "{{.Export}}", "-export"}
+	if s.buildTags != "" {
+		args = append(args, "-tags", s.buildTags)
+	}
+	args = append(args, pkgPath)
+	cmd := exec.Command("go", args...)
 	b, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("failed getting export for %v: %w. Output: %s", pkgPath, err, b)
@@ -521,6 +552,9 @@ func (s *Superpose) depPkgActionIDs() (map[string][]byte, error) {
 		// package). So during link we use importcfg to know dependents.
 		// TODO(cretz): Why not change to always using importcfg?
 		args := []string{"list", "-f", "{{.ImportPath}}|{{.BuildID}}", "-export"}
+		if s.buildTags != "" {
+			args = append(args, "-tags", s.buildTags)
+		}
 		if s.pkgPath != "command-line-arguments" {
 			pkgPath, forTest := s.pkgPath, s.pkgForTest
 			if strings.HasSuffix(pkgPath, ".test") {

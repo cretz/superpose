@@ -46,7 +46,7 @@ func (transformer) Transform(
 				continue
 			}
 			funcObj, _ := pkg.TypesInfo.ObjectOf(decl.Name).(*types.Func)
-			if funcObj == nil || funcObj.FullName() != "github.com/cretz/superpose/tests/simple.ReturnString" {
+			if funcObj == nil || funcObj.Name() != "ReturnString" {
 				continue
 			}
 			res.Patches = append(res.Patches, &superpose.Patch{

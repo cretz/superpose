@@ -20,6 +20,7 @@ TODO(cretz): Explain
 * Knowing whether you're running in another dimension
 * Usage inside toolexec
 * Advanced options (additional deps, cache, line directives, additional flags, etc)
+* How build tags have to be specified
 * Testing
 * Concepts/definitions
 
@@ -54,12 +55,6 @@ TODO(cretz):
 
 * More docs
 * Tests, including:
-  * An import whose package name is not related to its path
-  * Relative/local imports
-  * Explicit import aliases
-  * Different build tags
-  * Transforming test files/packages
-  * Test for transformer inside _test package
   * go:embed
   * Build caching
   * Build "-a" to invalidate cache
