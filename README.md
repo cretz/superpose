@@ -144,8 +144,8 @@ func (transformer) Transform(
 ) (*superpose.TransformResult, error) {
   // Change any ReturnString function to return "foo"
   res := &superpose.TransformResult{
-    // We set this to true so we can make sure our patched appears like it was
-    // named the original file name
+    // We set this to true so we can make sure our patched file appears like it
+    // was named the original file name
     AddLineDirectives: true,
     // If verbose is on, this will log the entirety of every patched file, which
     // we want during development
@@ -177,9 +177,9 @@ func (transformer) Transform(
 }
 ```
 
-Not, in any package underneath `example.com/mymodule` that has a `ReturnString` top-level function, we will change it
-to just return `"foo"`. A more advanced example would have done some type checking to confirm the function looked right,
-but this is a simplified example.
+In any package underneath `example.com/mymodule` that has a `ReturnString` top-level function, we will change it to just
+return `"foo"`. A more advanced example would have done some type checking to confirm the function looked right, but
+this is a simplified example.
 
 Note how we built a patch and set `AddLineDirectives: true` and added `/*line :<line>*/` to our patch. Superpose works
 on patches instead of AST alterations. This is important to retain line information. When we may alter line counts but
@@ -255,10 +255,10 @@ Will output:
     Normal code: original string
     Other dimension code: foo
 
-Bridge functions don't have to be in the main package, they can be in any package that . Any number of bridge functions
-can be defined. Since package-level vars are different in different dimensions, it may make sense to have a bridge
-function reference/mutate them. Note, types from a transformed package can't be used as parameter/return to the bridge
-function because it will appear as another type in the bridge and a compile error will occur.
+Bridge functions do not have to be in the main package. Any number of bridge functions can be defined. Since
+package-level vars are different in different dimensions, it may make sense to have a bridge function reference/mutate
+them. Note, types from a transformed package can't be used as parameter/return to the bridge function because it will
+appear as another type in the bridge and a compile error will occur.
 
 ### Knowing we're in a dimension
 
@@ -328,7 +328,7 @@ Some guidance on patching:
 * Patches should alter the existing code as little as possible to help preserve line counts
 * `go fmt` is not applied on patched code
   * For example, many lines of code can be put on a single line separated by semicolons, which Go supports
-  * A semicolon can be added after
+  * A semicolon can be added after an existing statement to add another statement on the same line
 * Using an existing AST position and adding or subtracting `1` will reference the character right after or before
   respectively
 * If it is known a patch may alter line count, use a `/*line :<line>*/`-style
@@ -347,10 +347,10 @@ the linker needs to know about any new packages to include at compile time. This
 package name as a key on the `TransformResult.IncludeDependencyPackages` map. If the package is already a dependency of
 this package, it will have no effect.
 
-When Go compiles a package, it first collects and compiles its dependencies. Go then expects all dependencies are
-compiled before the current package is compiled. Therefore, any dependencies added to this map must have already been
-compiled. And it must also be resolvable. `go list -f "{{.Export}}" -export qualified/pkg/path` is used to obtain the
-package file.
+When Go compiles a package, it first collects and compiles its dependencies. Go expects all dependencies are compiled
+before the current package is compiled. Therefore, any dependencies added to this map must have already been compiled.
+And it must also be resolvable. `go list -f "{{.Export}}" -export qualified/pkg/path` is used to obtain the package
+file.
 
 Users are encouraged to have their transformer code _and_ their runtime code explicitly reference the package that may
 be needed _somewhere_ in code so that it is included as a `go.mod` dependency at compile time and runtime. In cases
@@ -374,7 +374,7 @@ config.
 
 `Version` should be unique for each change of a transformer that would alter code. Otherwise old cached builds from a
 previous version of the same transformer may be used. Many developers may choose to use
-`superpose.MustLoadCurrentExeContentID` which is the content ID of the current executable (so it changes when the exe
+`superpose.MustLoadCurrentExeContentID()` which is the content ID of the current executable (so it changes when the exe
 changes). This is a reasonable default choice but it has two downsides:
 
 * It runs `go tool buildid <current exe>` on every single Go compile/link command. So now every package that has to be
@@ -434,7 +434,7 @@ When `toolexec` is executed for the compile step, Superpose does two steps defin
 
 #### Compile dimensions
 
-If any transformers apply to the given package and it that package has not already been compiled in that dimension
+If any transformers apply to the given package and if that package has not already been compiled in that dimension
 before for its given action ID, we run the package through the transformers as described below.
 
 * [Load the package](https://pkg.go.dev/golang.org/x/tools/go/packages#Load)
@@ -450,7 +450,7 @@ before for its given action ID, we run the package through the transformers as d
 * Update the build ID argument of compile args for a derived hash for the dimension
 * Update the `importcfg` argument to a temp `importcfg` file containing updated dependencies that are applicable to
   this dimension and containing dependencies that were explicitly asked to be included by the transformer
-* Update the output of the config to a temp file placeholder
+* Update the output argument of compile args to a temp file placeholder
 * Run compile
 * Copy the built package file to the Superpose build cache
 * Add metadata in the Superpose build cache containing explicitly-requested dependencies to include
@@ -487,11 +487,11 @@ TODO(cretz):
 ## Why
 
 At [Temporal](https://temporal.io/), workflows in Go are written using our SDK. Workflow code is required to be
-deterministic and isolated. Currently, Temporal just asks that users do not use the non-deterministic constructs in Go
+deterministic and isolated. Currently, Temporal just asks that users to not use the non-deterministic constructs in Go
 (i.e. async constructs, external stuff, map ranging, global state mutation). This is part of a research project to see
 if we can make an insecure sandbox that does make those constructs deterministic so the code doesn't have to concern
-itself with safety. So we can make map ranging deterministic, do goroutine-local globals, use more deterministic async
-constructs, and somewhat restrict external system access in an acceptably-not-foolproof way.
+itself with safety. So we can make map ranging deterministic, do goroutine-local globals, use deterministic emulations
+of Go async constructs, and somewhat restrict external system access in an acceptably-not-foolproof way.
 
 ## TODO
 
