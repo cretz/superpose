@@ -24,9 +24,7 @@ func main() {
 			// Set to true to see compilation details
 			Verbose: false,
 		},
-		superpose.RunMainConfig{
-			AssumeToolexec: true,
-		},
+		superpose.RunMainConfig{},
 	)
 }
 
@@ -85,7 +83,7 @@ func (transformer) Transform(
 			})
 
 			// We have to also tell the linker that we have a new dependency
-			res.IncludeDependentPackages = map[string]struct{}{"github.com/cretz/superpose/example/mocktime/clock": {}}
+			res.IncludeDependencyPackages = map[string]struct{}{"github.com/cretz/superpose/example/mocktime/clock": {}}
 
 			// Now we want to replace the body with our return, but also we need a
 			// line directive to tell it to pick up where it left off when it sees the

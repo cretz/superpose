@@ -1,6 +1,6 @@
 # Map Order
 
-This example shows a superpose-based compiler with two dimensions for deterministic map iteration.
+This example shows a superpose-based compiler with deterministic map iteration.
 
 ## Compiling
 
@@ -13,3 +13,5 @@ Now it can be executed as toolexec, for example:
     go run -toolexec /path/to/superpose-maporder ./example/maporder
 
 Note how the output of the second map print is deterministically sorted each time.
+
+TODO(cretz): Insertion-based ordering for maps

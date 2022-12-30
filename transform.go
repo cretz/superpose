@@ -58,13 +58,13 @@ type TransformResult struct {
 	// system does that).
 	Patches []*Patch
 
-	// IncludeDependentPackages is a set of packages that should be included on
+	// IncludeDependencyPackages is a set of packages that should be included on
 	// the transformed code that may not have been included in the original code.
 	// this is important for the Go compiler/linker since they can't otherwise
 	// know ahead of time what the new dependencies are. Since these reference Go
 	// cache during build, these modules should already be built and in the Go
 	// cache.
-	IncludeDependentPackages map[string]struct{}
+	IncludeDependencyPackages map[string]struct{}
 
 	// AddLineDirectives, if true, will add a line directive to the top of each
 	// patched Go file informing the Go compiler that the dimension filename is
@@ -92,7 +92,7 @@ type Patch struct {
 	Captures map[string]Range
 
 	// Str is the string to replace with. If there are any "{{", this is a Go
-	// template where the map keys are indices of the `Captures`` and the values
+	// template where the map keys are indices of the `Captures` and the values
 	// the captured strings.
 	Str string
 }

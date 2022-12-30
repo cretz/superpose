@@ -331,7 +331,7 @@ func (s *Superpose) compilePatches(
 	seenDependentPackages := map[string]bool{}
 	var metadata dimPkgMetadata
 	for _, transformedRes := range transformed {
-		for depPkg := range transformedRes.IncludeDependentPackages {
+		for depPkg := range transformedRes.IncludeDependencyPackages {
 			if seenDependentPackages[depPkg] {
 				continue
 			}
@@ -341,7 +341,7 @@ func (s *Superpose) compilePatches(
 				return fmt.Errorf("failed including dependent package %v in dimension %v: %w", depPkg, ctx.Dimension, err)
 			}
 			// Include in metadata
-			metadata.IncludeDependentPackages = append(metadata.IncludeDependentPackages, depPkg)
+			metadata.IncludeDependencyPackages = append(metadata.IncludeDependencyPackages, depPkg)
 		}
 	}
 	// Write out import cfg

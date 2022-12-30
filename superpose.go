@@ -82,12 +82,6 @@ type Superpose struct {
 
 // RunMainConfig is configuration for [RunMain].
 type RunMainConfig struct {
-	// AssumeToolexec, if true, assumes the main run is as `-toolexec`.
-	//
-	// Currently required as true since toolexec form is the only currently
-	// supported form.
-	AssumeToolexec bool
-
 	// AdditionalFlags, if set, are additional flags that can be passed to this
 	// toolexec. They are removed from the upstream arguments. This flag set is
 	// mutated internally to add superpose-specific flags.
@@ -155,12 +149,6 @@ func (s *Superpose) RunMain(ctx context.Context, args []string, config RunMainCo
 
 	// Set original args
 	s.origCLIArgs = args
-
-	// TODO(cretz): Support more approaches such as wrapping Go build or
-	// go:generate or manual go build
-	if !config.AssumeToolexec {
-		return fmt.Errorf("only assume toolexec currently supported")
-	}
 
 	// Parse pre-tool args
 	var err error
@@ -390,7 +378,7 @@ func (s *Superpose) onLink(ctx context.Context, args []string) error {
 			dimPkgRefs.addRef(origPkgPath, dim)
 
 			// Include dependent packages
-			for _, depPkg := range metadata.IncludeDependentPackages {
+			for _, depPkg := range metadata.IncludeDependencyPackages {
 				if err := importCfg.includePkg(depPkg); err != nil {
 					return fmt.Errorf("failed including dependent %v package for package %v in dimension %v: %w",
 						depPkg, origPkgPath, dim, err)
@@ -471,7 +459,7 @@ func (s *Superpose) pkgFile(pkgPath string) (string, error) {
 }
 
 type dimPkgMetadata struct {
-	IncludeDependentPackages []string `json:"includeDependentPackages"`
+	IncludeDependencyPackages []string `json:"includeDependencyPackages"`
 }
 
 func (s *Superpose) getDimPkgMetadata(actionID []byte) (*dimPkgMetadata, error) {

@@ -20,9 +20,7 @@ func main() {
 			// Set to true to see compilation details
 			Verbose: false,
 		},
-		superpose.RunMainConfig{
-			AssumeToolexec: true,
-		},
+		superpose.RunMainConfig{},
 	)
 }
 
@@ -79,7 +77,7 @@ func (transformer) Transform(
 
 			// We have to also tell the linker that we have a new dependency on
 			// "strings" just in case it wasn't there before
-			res.IncludeDependentPackages = map[string]struct{}{"strings": {}}
+			res.IncludeDependencyPackages = map[string]struct{}{"strings": {}}
 
 			// Now change the second parameter, string, to replace "Hello" with
 			// "Aloha". Note, we don't assume the param name, we obtain it for

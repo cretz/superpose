@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"go/ast"
-	"go/types"
 	"strings"
 
 	"github.com/cretz/superpose"
@@ -17,9 +17,7 @@ func main() {
 			Transformers: map[string]superpose.Transformer{"tests-simple": transformer{}},
 			Verbose:      true,
 		},
-		superpose.RunMainConfig{
-			AssumeToolexec: true,
-		},
+		superpose.RunMainConfig{},
 	)
 }
 
@@ -42,16 +40,15 @@ func (transformer) Transform(
 		for _, decl := range file.Decls {
 			// Add patch if it's the func we want
 			decl, _ := decl.(*ast.FuncDecl)
-			if decl == nil {
-				continue
-			}
-			funcObj, _ := pkg.TypesInfo.ObjectOf(decl.Name).(*types.Func)
-			if funcObj == nil || funcObj.Name() != "ReturnString" {
+			if decl == nil || decl.Name.Name != "ReturnString" {
 				continue
 			}
 			res.Patches = append(res.Patches, &superpose.Patch{
 				Range: superpose.Range{Pos: decl.Body.Lbrace + 1, End: decl.Body.Rbrace},
-				Str:   ` return "foo" `,
+				Str: fmt.Sprintf(
+					` return "foo" /*line :%v*/`,
+					pkg.Fset.Position(decl.Body.Rbrace).Line,
+				),
 			})
 		}
 	}

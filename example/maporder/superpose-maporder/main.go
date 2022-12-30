@@ -22,9 +22,7 @@ func main() {
 			// Set to true to see compilation details
 			Verbose: false,
 		},
-		superpose.RunMainConfig{
-			AssumeToolexec: true,
-		},
+		superpose.RunMainConfig{},
 	)
 }
 
@@ -71,7 +69,7 @@ func (t *transformer) Transform(
 				Range: superpose.Range{Pos: file.Name.End()},
 				Str:   fmt.Sprintf("; import %s %q", mapIterAlias, mapIterPkg),
 			})
-			res.IncludeDependentPackages = map[string]struct{}{
+			res.IncludeDependencyPackages = map[string]struct{}{
 				mapIterPkg:                     {},
 				"golang.org/x/exp/constraints": {},
 			}
