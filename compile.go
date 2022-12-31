@@ -280,7 +280,7 @@ func (s *Superpose) compilePatches(
 			if err != nil {
 				return err
 			}
-			if transformed[i].LogPatchedFiles {
+			if s.Config.Verbose && transformed[i].LogPatchedFiles {
 				s.Debugf("In dimension %v, patched %v to:\n%s", ctx.Dimension, origFile, newBytes)
 			}
 			_, err = tmpFile.Write(newBytes)

@@ -338,6 +338,11 @@ Some guidance on patching:
   with removing code in these situations
 * It is often better to immediately delegate to some proper written package for a task than to have a complicated set of
   patches (see next section)
+* Although there is a `WrapWithPatch`, if patching things that are not full replacements, two patches should be used
+  make a "wrapping" patch (like one that calls another function) - one for the LHS and one for the RHS (if needed).
+  This is because an inner expression of what is being wrapped may also be transformed by the transformer and would
+  cause patch overlap. Granted if it is known that nothing internal could ever be recursively transformed, no need to
+  follow this suggestion.
 
 #### Including dependency packages during transformation
 

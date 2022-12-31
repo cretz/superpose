@@ -104,6 +104,15 @@ func WrapWithPatch(n ast.Node, lhs, rhs string) *Patch {
 	return &Patch{Range: r, Captures: map[string]Range{"__1__": r}, Str: lhs + "{{.__1__}}" + rhs}
 }
 
+// LineResetPatch returns a patch just after the given node end that adds a line
+// directive comment to set the line back to what it was before alteration.
+func (t *TransformPackage) LineResetPatch(n ast.Node) *Patch {
+	return &Patch{
+		Range: Range{Pos: n.End() + 1},
+		Str:   fmt.Sprintf("/*line :%v*/", t.Fset.Position(n.End()).Line),
+	}
+}
+
 // ApplyPatches applies the given patches to the fileset and returns a map of
 // only affected files and their final contents. Note, this function may reorder
 // the given patches slice.

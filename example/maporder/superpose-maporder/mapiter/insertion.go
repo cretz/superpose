@@ -25,6 +25,25 @@ type insertionMap[K comparable, V any] struct {
 	keyIndicesLock sync.RWMutex
 }
 
+type lit[M ~map[K]V, K comparable, V any] map[K]V
+
+func NewTrackedMapLit[M ~map[K]V, K comparable, V any](size int) lit[M, K, V] {
+	return lit[M, K, V](MakeTrackedMap[M](size))
+}
+
+func (l lit[M, K, V]) Put(k K, v V) lit[M, K, V] {
+	TrackedPut(l, k, v)
+	return l
+}
+
+func (l lit[M, K, V]) Done() M {
+	return map[K]V(l)
+}
+
+func MakeTrackedMap[M ~map[K]V, K comparable, V any](size int) M {
+	return TrackMap(make(M, size))
+}
+
 func TrackMap[K comparable, V any](m map[K]V) map[K]V {
 	// Take pointer and add finalizer to remove
 	im := &insertionMap[K, V]{}
@@ -40,8 +59,10 @@ func TrackMap[K comparable, V any](m map[K]V) map[K]V {
 	return m
 }
 
-func TrackedPut[K comparable, V any](m map[K]V, k K, v V) {
+func TrackedPut[K comparable, V any](m map[K]V, k K, v V) struct{} {
 	getInsertionMap(m).put(m, k, v)
+	// We need to return a value in cases like multi-assign
+	return struct{}{}
 }
 
 func TrackedDelete[K comparable, V any](m map[K]V, k K) {
